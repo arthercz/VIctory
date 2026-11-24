@@ -1293,3 +1293,152 @@ fn wave64_split_readfirstlane_per_console_wave() {
     }
     assert!(ran > 0, "no SM 6.6 device with 32-lane waves");
 }
+
+/// An exchange inside a loop: the ballot is re-taken every iteration (the
+/// loop body is one static site, executed per iteration), and the count
+/// accumulates 48 per iteration over 4 iterations in both split forms.
+#[test]
+fn wave64_split_exchange_inside_a_loop() {
+    let mut body = vec![
+        0xBE90_0380, // s_mov_b32 s16, 0: the accumulator
+        0xBE91_0380, // s_mov_b32 s17, 0: the iteration counter
+    ];
+    // loop:
+    body.push(0x3606_00BF); // v_and_b32 v3, 63, v0: the lane in the console wave
+    body.extend_from_slice(&[0x7D88_06FF, 48]); // v_cmp_gt_u32 vcc, 48, v3
+    body.push(0xBE92_106A); // s_bcnt1_i32_b64 s18, vcc (the exchange)
+    body.push(0x8010_1210); // s_add_u32 s16, s16, s18
+    body.push(0x8011_8111); // s_add_u32 s17, s17, 1
+    body.push(0xBF0A_8411); // s_cmp_lt_u32 s17, 4
+    let imm = 2i32 - (body.len() as i32 + 1);
+    body.push(0xBF85_0000 | (imm as u16 as u32)); // s_cbranch_scc1 loop
+    body.push(vop1(0x001, 0, sgpr(16))); // v_mov_b32 v0, s16
+
+    // Barrier variant: one console wave per group.
+    let shader = build_cs(&body, true, [64, 1, 1], false);
+    let mut ran = 0;
+    for (backend, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else { continue };
+        if host.wave_lanes() < 32 {
+            continue;
+        }
+        let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(1)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .expect("dispatch");
+        assert_eq!(out[0][0], 192, "{backend} barrier loop exchange");
+        ran += 1;
+    }
+    assert!(ran > 0, "no SM 6.6 device with 32-lane waves");
+
+    // Counter rendezvous: two console waves per group, each accumulating
+    // its own 48 per iteration.
+    let mut words = vec![0xBE85_0380, 0xF40C_0302, 0xFA00_0000];
+    words.extend_from_slice(&body[..body.len() - 1]);
+    words.push(vop1(0x001, 2, sgpr(16))); // v_mov_b32 v2, s16
+    words.push(0x3402_0082); // v_lshlrev_b32 v1, 2, v0
+    words.push(0x38 << 26 | 0x1C << 18 | 1 << 12);
+    words.push(0x80 << 24 | ((12 >> 2) & 0x1F) << 16 | 2 << 8 | 1);
+    words.push(S_ENDPGM);
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: true,
+        vgprs: 8,
+        layout: vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 4,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 1,
+            },
+        ],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 5 << 1,
+            threads: [128, 1, 1],
+        }),
+        code,
+    };
+    let p = ir::build(&native.code, true, 8).expect("ir");
+    let res = resource::track(&p, &native.layout, native.stage).expect("resource");
+    let io = io::raise(&p, &native).expect("io");
+    let st = structure::structure(&p).expect("structure");
+    let lowered = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+        host_wave64: false,
+    })
+    .expect("lower");
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+    };
+    let mut ran = 0;
+    for (backend, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else { continue };
+        if host.wave_lanes() < 32 {
+            continue;
+        }
+        let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(128)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .expect("dispatch");
+        assert_eq!(out[0][0], 192, "{backend} rt loop exchange wave0");
+        assert_eq!(out[0][64], 192, "{backend} rt loop exchange wave1");
+        assert_eq!(out[0][127], 192, "{backend} rt loop exchange wave1 last");
+        ran += 1;
+    }
+    assert!(ran > 0, "no SM 6.6 device with 32-lane waves");
+}

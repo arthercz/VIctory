@@ -2077,6 +2077,30 @@ impl<'a> Lower<'a> {
         self.s.m.load(at, p)
     }
 
+    /// Split: a coherent scalar load's written values take the lower
+    /// half's load in both halves (the console's GLC/DLC is coherent;
+    /// without this the halves could read different values when memory
+    /// changes between their loads and desync the exchanges).
+    fn split_glc_exchange(&mut self, inst: &Inst) -> Result<(), Why> {
+        let is_lo = {
+            let at = self.cur;
+            let half = self.split_half(at);
+            let z = self.s.m.i32(0);
+            self.s.m.cmp(at, pred::EQ, half, z)
+        };
+        for &(reg, value) in &inst.writes {
+            if !matches!(reg, Reg::S(_)) {
+                continue;
+            }
+            let own = self.i32_of(value)?;
+            let other = self.split_share(SPLIT_LANE_READ, own);
+            let at = self.cur;
+            let r = self.s.m.select(at, is_lo, own, other);
+            self.vals.insert(value, Val::I32(r));
+        }
+        Ok(())
+    }
+
     /// Split: like [`split_share`] for a (value, ballot) pair, stored
     /// together under one barrier (`v_readfirstlane_b32` needs both).
     /// The region banks two dwords per lane: [2 * lane, 2 * lane + 1].
@@ -2290,6 +2314,15 @@ impl<'a> Lower<'a> {
     }
 
     fn split_share_pair(&mut self, slot: u32, a: V, b: V) -> (V, V) {
+        if self.split_waves > 1 {
+            // The counter rendezvous has no group barrier to meet under;
+            // exchange the two words in two sequenced rounds. Both halves
+            // run the rounds in the same order at the same program point,
+            // so the pair stays consistent.
+            let x = self.split_share_rt(a);
+            let y = self.split_share_rt(b);
+            return (x, y);
+        }
         let at = self.cur;
         let lds = self.s.lds();
         let i32t = self.s.t.i32;
@@ -2871,7 +2904,17 @@ impl<'a> Lower<'a> {
                 Ok(())
             }
             Fields::Sopp { .. } => Ok(()),
-            Fields::Smem { .. } => self.smem(inst, (b, i)),
+            // A coherent scalar load in a split program: the halves must
+            // see the same value (the console's GLC/DLC is coherent), so
+            // the lower half's load wins. A plain load stays incoherent,
+            // as on the console.
+            Fields::Smem { cache, .. } => self.smem(inst, (b, i)).and_then(|()| {
+                if self.split && (cache.glc || cache.dlc) {
+                    self.split_glc_exchange(inst)
+                } else {
+                    Ok(())
+                }
+            }),
             Fields::Valu(_) if name.starts_with("v_interp_") => self.interp(inst, (b, i)),
             Fields::Valu(_) => self.valu(inst, b, i),
             Fields::Vintrp { .. } => self.interp(inst, (b, i)),
@@ -4699,6 +4742,9 @@ impl<'a> Lower<'a> {
                     let active = self.s.m.extract(at, active, 0);
                     let (other, other_active) =
                         self.split_share_pair(SPLIT_FIRST_LANE, own, active);
+                    // The exchanges end in join blocks; what follows must
+                    // anchor there, not at the pre-exchange block.
+                    let at = self.cur;
                     let half = self.split_half(at);
                     let z = self.s.m.i32(0);
                     let is_lo = self.s.m.cmp(at, pred::EQ, half, z);
@@ -4709,7 +4755,7 @@ impl<'a> Lower<'a> {
                         self.s.m.select(at, lo_empty, one, z)
                     };
                     let mine = self.s.m.cmp(at, pred::EQ, winner, half);
-                    let r = self.s.m.select(self.cur, mine, own, other);
+                    let r = self.s.m.select(at, mine, own, other);
                     return int(self, r);
                 }
                 let r = self.s.op(

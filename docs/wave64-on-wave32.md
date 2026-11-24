@@ -134,6 +134,10 @@ XCL.
    (ignored, needs the out-of-tree HLSL build).
    Lane reads (`v_readlane`, `v_readfirstlane`) in multi-wave groups are
    refused for now.
+5. **Coherent scalar loads.** GLC/DLC `s_load*` values exchange with
+   the lower half's load winning in both halves (`split_glc_exchange`);
+   plain loads stay incoherent, as on the console. Done, synthetic-test
+   coverage pending.
 7. **VS/PS.** Graphics stages get no `WaveSize`; on a 32-lane host a
    wave64 VS/PS runs as a partial wave whose lanes 32..63 are missing
    (XCL's `upper_lanes` data-flow: constants and spill slots for those

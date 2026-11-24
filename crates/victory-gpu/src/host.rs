@@ -362,7 +362,7 @@ pub(crate) fn dred_on() -> bool {
 #[cfg(feature = "diagnostics")]
 fn timing() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_GPU_TIMING").is_some())
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GPU_TIMING").is_some() || crate::profile::on())
 }
 
 /// Names a host object for the device-removed report, which names the
@@ -613,12 +613,55 @@ impl Host {
                     tracing::warn!("slow list command, {ms:.1} ms: {op}");
                 }
             }
+            #[cfg(feature = "diagnostics")]
+            if crate::profile::on() {
+                let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
+                let pipes = {
+                    let p = runs[i].pipelines.lock().unwrap_or_else(|e| e.into_inner());
+                    crate::profile::strings(p.iter().map(String::as_str))
+                };
+                let ms = started.elapsed().as_secs_f64() * 1e3;
+                let t = crate::profile::now();
+                let commands = runs[i]
+                    .notes
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .len();
+                crate::profile::event(format!(
+                    "{{\"k\":\"list\",\"id\":{submitted},\"i\":{i},\"t\":{t:.3},\"ms\":{ms:.3},\"cmds\":{commands},\"pipelines\":{pipes}}}"
+                ));
+                for (ms, op) in runs[i].slowest(frequency, usize::MAX) {
+                    crate::profile::event(format!(
+                        "{{\"k\":\"cmd\",\"id\":{submitted},\"i\":{i},\"t\":{t:.3},\"ms\":{ms:.3},\"op\":{}}}",
+                        crate::profile::quote(&op)
+                    ));
+                }
+            }
             let _ = (i, started);
         }
         let _ = &firsts;
         let gpu = prepared.elapsed();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        if crate::profile::on() {
+            let pipelines: std::collections::BTreeSet<String> = runs
+                .iter()
+                .flat_map(|l| {
+                    l.pipelines
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone()
+                })
+                .collect();
+            crate::profile::event(format!(
+                "{{\"k\":\"sub\",\"id\":{submitted},\"t\":{:.3},\"ms\":{:.3},\"lists\":{},\"pipelines\":{}}}",
+                crate::profile::now(),
+                gpu.as_secs_f64() * 1e3,
+                runs.len(),
+                crate::profile::strings(pipelines.iter().map(String::as_str))
+            ));
+        }
         // The host resets a device whose submission runs for about 2 s.
         if gpu > std::time::Duration::from_millis(250) {
             let pipelines: std::collections::BTreeSet<String> = runs
@@ -916,6 +959,14 @@ impl HostList {
     #[cfg(feature = "diagnostics")]
     fn slowest(&self, frequency: u64, n: usize) -> Vec<(f64, String)> {
         let notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
+        if std::env::var_os("VICTORY_PROFILE_DEBUG").is_some() {
+            eprintln!(
+                "slowest: notes={} stamps={} timing={}",
+                notes.len(),
+                self.stamps().is_some(),
+                timing()
+            );
+        }
         let (Some((_, back)), count) = (self.stamps(), notes.len().min(STAMPS as usize - 1)) else {
             return Vec::new();
         };
@@ -1076,7 +1127,7 @@ impl HostList {
 
     #[cfg(feature = "diagnostics")]
     fn note(&self, what: impl FnOnce() -> String, range: Option<(u64, u64)>) {
-        if dred_on() {
+        if dred_on() || crate::profile::on() {
             let at = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32;
             if let Some((heap, _)) = self.stamps()
                 && at < STAMPS - 1

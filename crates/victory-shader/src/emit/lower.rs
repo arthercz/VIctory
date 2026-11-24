@@ -455,11 +455,14 @@ impl<'a> Lower<'a> {
             // out of scope (its barrier-free assumption breaks across
             // halves).
             let threads = cs.threads.iter().product::<u32>();
-            split = x.native.wave64
-                && !x.host_wave64
-                && console_lanes
-                && threads <= SPLIT_MAX_THREADS
-                && cs.lds_bytes() == 0;
+            // LDS is fine: the program keeps its dwords and the exchange
+            // tail sits above them, accesses clamped below (the console's
+            // intra-wave barrier-free sharing is the one approximation —
+            // the halves are not wave-synchronous, but every exchange's
+            // barrier re-syncs them, and RDNA2 compute shaders barrier
+            // their LDS sharing in practice).
+            split =
+                x.native.wave64 && !x.host_wave64 && console_lanes && threads <= SPLIT_MAX_THREADS;
             if split {
                 split_threads = threads;
                 split_waves = threads.div_ceil(64);
@@ -2707,12 +2710,6 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::V(reg), r, guard);
             return Ok(());
         }
-        if self.split {
-            // Split waves reserve the TGSM tail for exchanges; program LDS
-            // is out of scope (its barrier-free single-wave assumption does
-            // not hold across the two halves).
-            return Err("group-shared memory in a split wave64 program");
-        }
         if self.s.lds_dwords == 0 {
             return Err("LDS the program does not allocate");
         }
@@ -2725,6 +2722,18 @@ impl<'a> Lower<'a> {
             let at = l.s.m.bin(c, Bin::Add, a, o);
             let two = l.s.m.i32(2);
             let index = l.s.m.bin(c, Bin::LShr, at, two);
+            // Split programs: the exchange tail sits above the program's
+            // LDS dwords; clamp the program's accesses below it (the
+            // console drops out-of-bounds writes and reads 0 — the clamp
+            // keeps the tail intact at the cost of folding wild accesses
+            // onto the last program dword).
+            let index = if l.split {
+                let max = l.s.m.i32(l.split_lds_base.saturating_sub(1));
+                let over = l.s.m.cmp(c, pred::IULT, max, index);
+                l.s.m.select(c, over, max, index)
+            } else {
+                index
+            };
             let lds = l.s.lds();
             l.s.m.element(c, lds, index)
         };

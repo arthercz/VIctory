@@ -6,15 +6,17 @@
 //! just before its execution, by a compute shader of ours (HLSL compiled by
 //! the system's compiler; a 5.1 shader with its root signature inside).
 //!
-//! Each list also has a budget (2^27 vertex instances or threads, groups
-//! counted as 64 threads, mesh groups as 128): records past it run empty,
-//! so a list of thousands of garbage records cannot run for seconds
-//! either.
+//! Each list also has budgets (2^27 vertex instances or threads, and 2^15
+//! mesh groups): records past them run empty, so a list of thousands of
+//! garbage records cannot run for seconds either. A mesh record is limited
+//! to 4,096 groups. Captured direct mesh work peaks at 260 groups; allowing
+//! the D3D12 dimensional maximum here let one corrupt indirect record keep
+//! the RX 6700 XT busy until TDR.
 //!
 //! shortcut: the bounds (2^24 vertices, 2^26 vertex instances, 65,535
-//! groups per dimension and 2^20 per dispatch, one-dimensional mesh
-//! dispatches, the budget) cut legitimate work beyond them; raise them if
-//! the title needs more.
+//! compute groups per dimension and 2^20 per dispatch, 4,096 groups per
+//! one-dimensional mesh dispatch, the budget) cut legitimate work beyond
+//! them; raise them if the title needs more.
 
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
@@ -31,14 +33,18 @@ RWByteAddressBuffer args : register(u0);
 // records run empty.
 RWByteAddressBuffer budget : register(u1);
 static const uint BUDGET = 1u << 27;
+static const uint MESH_BUDGET = 1u << 15;
 // Groups of one dispatch; more run empty.
 static const uint GROUPS = 1u << 20;
+static const uint MESH_GROUPS = 1u << 12;
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     if (id.x >= records) return;
     uint at = id.x * stride;
     uint cost;
+    uint counter = 0;
+    uint limit = BUDGET;
     if (kind <= 1) {
         // Draws: vertex or index count, then instances.
         uint count = min(args.Load(at), 1u << 24);
@@ -56,13 +62,15 @@ void main(uint3 id : SV_DispatchThreadID) {
     } else {
         // Mesh dispatches: the console's are one-dimensional.
         uint3 g = args.Load3(at);
-        g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
-        cost = g.x * g.y * g.z * 128;
+        g = uint3(min(g.x, MESH_GROUPS), min(g.y, 1u), min(g.z, 1u));
+        cost = g.x * g.y * g.z;
+        counter = 4;
+        limit = MESH_BUDGET;
         args.Store3(at, g);
     }
     uint before;
-    budget.InterlockedAdd(0, cost, before);
-    if (before >= BUDGET || before + cost > BUDGET) {
+    budget.InterlockedAdd(counter, cost, before);
+    if (before >= limit || before + cost > limit) {
         // Draws keep their layout with no vertices; groups become zero.
         args.Store(at, 0);
     }
@@ -212,6 +220,16 @@ fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
 
 #[cfg(test)]
 mod tests {
+    /// A corrupt mesh record must not regain D3D12's 65,535-group maximum:
+    /// one such GTA VI record ran until Windows reset the RX 6700 XT.
+    #[test]
+    fn mesh_indirect_work_is_tdr_bounded() {
+        assert!(super::SOURCE.contains("MESH_GROUPS = 1u << 12"));
+        assert!(super::SOURCE.contains("min(g.x, MESH_GROUPS)"));
+        assert!(super::SOURCE.contains("MESH_BUDGET = 1u << 15"));
+        assert!(super::SOURCE.contains("counter = 4"));
+    }
+
     /// The clamp compiles with the system's compiler and the host takes it.
     #[test]
     fn argument_clamp_builds() {

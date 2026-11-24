@@ -565,19 +565,17 @@ impl Host {
         }
         batch.flush();
         let prepared = std::time::Instant::now();
-        // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
-        #[cfg(feature = "diagnostics")]
-        let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
-            firsts
-                .iter()
-                .zip(firsts.iter().skip(1).chain([&lists.len()]))
-                .map(|(&a, &b)| &lists[a..b])
-                .collect()
-        } else {
-            vec![&lists[..]]
-        };
-        #[cfg(not(feature = "diagnostics"))]
-        let groups = [&lists[..]];
+        // Each run's lists execute and are waited for on their own. The host
+        // resets a device whose submission runs for about 2 s (TDR); with
+        // the world streaming, one submission of many lists easily exceeds
+        // that, while the lists themselves are each well under it. Separate
+        // submissions give the OS a completion point per list, so only a
+        // single list longer than the limit can still trip it.
+        let groups: Vec<&[Option<ID3D12CommandList>]> = firsts
+            .iter()
+            .zip(firsts.iter().skip(1).chain([&lists.len()]))
+            .map(|(&a, &b)| &lists[a..b])
+            .collect();
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
@@ -609,7 +607,7 @@ impl Host {
                     commands,
                     "slow host list"
                 );
-                for (ms, op) in runs[i].slowest(frequency, 6) {
+                for (_, ms, op) in runs[i].slowest(frequency, 6) {
                     tracing::warn!("slow list command, {ms:.1} ms: {op}");
                 }
             }
@@ -631,12 +629,24 @@ impl Host {
                 crate::profile::event(format!(
                     "{{\"k\":\"list\",\"id\":{submitted},\"i\":{i},\"t\":{t:.3},\"ms\":{ms:.3},\"cmds\":{commands},\"pipelines\":{pipes}}}"
                 ));
-                for (ms, op) in runs[i].slowest(frequency, usize::MAX) {
+                for (n, ms, op) in runs[i].slowest(frequency, usize::MAX) {
                     crate::profile::event(format!(
-                        "{{\"k\":\"cmd\",\"id\":{submitted},\"i\":{i},\"t\":{t:.3},\"ms\":{ms:.3},\"op\":{}}}",
+                        "{{\"k\":\"cmd\",\"id\":{submitted},\"i\":{i},\"n\":{n},\"t\":{t:.3},\"ms\":{ms:.3},\"op\":{}}}",
                         crate::profile::quote(&op)
                     ));
                 }
+            }
+            // Stop at the exact split list that removed the device instead
+            // of submitting the rest to an already dead queue. Its local
+            // slice also makes DRED and the final notes name only that list.
+            // SAFETY: a plain query.
+            if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+                fail(format_args!(
+                    "host GPU device removed in list {i} of {}{}{}",
+                    runs.len(),
+                    self.removal_data(&runs[i..=i]),
+                    last_notes(&runs[i..=i])
+                ));
             }
             let _ = (i, started);
         }
@@ -680,15 +690,6 @@ impl Host {
                 ?pipelines,
                 "slow host submission"
             );
-        }
-        // SAFETY: a plain query.
-        if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
-            fail(format_args!(
-                "host GPU device removed after a submission of {} lists{}{}",
-                runs.len(),
-                self.removal_data(runs),
-                last_notes(runs)
-            ));
         }
         // What shaders wrote goes back before the bottom-of-pipe writes,
         // which tell the title the GPU is done; each range once per
@@ -956,18 +957,11 @@ impl HostList {
     }
 
     /// The noted commands that took longest on the GPU, longest first, as
-    /// (milliseconds, text) (diagnostics, timing on, after the list ran).
+    /// (original index, milliseconds, text) (diagnostics, timing on, after
+    /// the list ran).
     #[cfg(feature = "diagnostics")]
-    fn slowest(&self, frequency: u64, n: usize) -> Vec<(f64, String)> {
+    fn slowest(&self, frequency: u64, n: usize) -> Vec<(usize, f64, String)> {
         let notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
-        if std::env::var_os("VICTORY_PROFILE_DEBUG").is_some() {
-            eprintln!(
-                "slowest: notes={} stamps={} timing={}",
-                notes.len(),
-                self.stamps().is_some(),
-                timing()
-            );
-        }
         let (Some((_, back)), count) = (self.stamps(), notes.len().min(STAMPS as usize - 1)) else {
             return Vec::new();
         };
@@ -985,16 +979,17 @@ impl HostList {
             back.Unmap(0, None);
             s
         };
-        let mut times: Vec<(f64, String)> = (0..count)
+        let mut times: Vec<(usize, f64, String)> = (0..count)
             .map(|i| {
                 let ticks = stamps[i + 1].saturating_sub(stamps[i]);
                 (
+                    i,
                     ticks as f64 * 1e3 / frequency.max(1) as f64,
                     notes[i].0.chars().take(300).collect(),
                 )
             })
             .collect();
-        times.sort_by(|a, b| b.0.total_cmp(&a.0));
+        times.sort_by(|a, b| b.1.total_cmp(&a.1));
         times.truncate(n);
         times
     }
@@ -1272,9 +1267,10 @@ impl HostList {
         if !deferred.budget_zeroed {
             deferred.budget_zeroed = true;
             let at = *data;
-            // SAFETY: the list's own mapped word, written before it runs.
+            // SAFETY: the list's own mapped draw/compute and mesh budget
+            // words, written before it runs.
             deferred.copies.push(Step::Host(Box::new(move || unsafe {
-                (at as *mut u32).write_volatile(0)
+                (at as *mut u64).write_volatile(0)
             })));
         }
         // SAFETY: a live buffer.

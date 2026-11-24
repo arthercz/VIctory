@@ -7353,40 +7353,6 @@ mod tests {
     /// 64-lane waves, and keeps WaveSize 64 otherwise. A group of two
     /// console waves does not split.
     #[test]
-    fn split_check_env_dumped_container() {
-        // Throwaway: SPLIT_CHECK_DXBC=<file> lowers a dumped container with
-        // the split active, printing whether it lowers or is refused.
-        let Ok(path) = std::env::var("SPLIT_CHECK_DXBC") else {
-            return;
-        };
-        let bytes = std::fs::read(&path).unwrap();
-        let c = crate::Container::parse(&bytes).unwrap();
-        let dxil = c.part(crate::FourCC::DXIL).unwrap();
-        for p in crate::native_programs(&dxil.data).unwrap() {
-            let program = crate::ir::build(&p.patched_code(), p.wave64, p.vgprs).unwrap();
-            let st = crate::structure::structure(&program).unwrap();
-            let res = crate::resource::track(&program, &p.layout, p.stage).unwrap();
-            let io = crate::io::raise(&program, &p).unwrap();
-            let r = lower(&Parts {
-                native: &p,
-                p: &program,
-                st: &st,
-                io: &io,
-                res: &res,
-                inputs: vec![],
-                outputs: vec![],
-                prims: vec![],
-                mesh_stride: 0,
-                host_wave64: false,
-            });
-            match r {
-                Ok(_) => println!("LOWERED OK"),
-                Err(e) => println!("REJECTED: {e}"),
-            }
-        }
-    }
-
-    #[test]
     fn wave64_splits_when_the_host_has_no_64_lane_waves() {
         // v_cmp_lt_u32 vcc, v0, 48; s_bcnt1_i32_b64 s10, vcc; endpgm. The
         // compare makes a lane mask, the bit count reads it as data.

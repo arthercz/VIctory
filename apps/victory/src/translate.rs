@@ -319,9 +319,15 @@ fn translate(
     let Some(dxil) = container.part(FourCC::DXIL).map(|p| p.data) else {
         return t.fail("no DXIL part (SM5 or older)".into(), example);
     };
-    if !lock(seen).insert(blake3::hash(dxil)) {
+    let dxil_hash = blake3::hash(dxil);
+    if !lock(seen).insert(dxil_hash) {
         t.duplicates += 1;
         return;
+    }
+    // With `--list`: the pipeline diagnostics name shaders by this hash.
+    if t.list {
+        t.lines
+            .push(format!("{} {}", &dxil_hash.to_hex()[..16], example()));
     }
     let programs = match native_programs(dxil) {
         Ok(p) => p,

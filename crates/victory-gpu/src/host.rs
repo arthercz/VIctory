@@ -489,6 +489,14 @@ impl Host {
             }
             .is_ok();
             let wave64 = ok && options.WaveLaneCountMax >= 64;
+            // Diagnostics: VICTORY_WAVE64=1 claims 64-lane waves (wave64
+            // programs then fail at pipeline creation, as before the split);
+            // =0 forces the split. For A/B testing the split's cost.
+            let wave64 = match std::env::var("VICTORY_WAVE64").as_deref() {
+                Ok("1") => true,
+                Ok("0") => false,
+                _ => wave64,
+            };
             victory_shader::emit::set_host_wave64(wave64);
             tracing::info!(wave64, "host 64-lane wave support");
             wave64

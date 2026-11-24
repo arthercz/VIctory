@@ -107,6 +107,15 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
+                // Diagnostics: VICTORY_DUMP_SHADERS=<dir> saves each
+                // container as <dir>/<hash>.dxbc on first translation.
+                if let Some(dir) = std::env::var_os("VICTORY_DUMP_SHADERS") {
+                    let path = std::path::Path::new(&dir).join(format!("{}.dxbc", self.hash));
+                    if !path.exists() {
+                        let _ = std::fs::create_dir_all(&dir);
+                        let _ = std::fs::write(&path, &self.container);
+                    }
+                }
                 let done = translate(&self.container);
                 match &done {
                     Ok(t) => tracing::info!(

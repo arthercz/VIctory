@@ -150,8 +150,18 @@ const SPLIT_LANE_READ: u32 = 65;
 /// Each half's (value, active-ballot) pair, banked by lane
 /// (`v_readfirstlane_b32`).
 const SPLIT_FIRST_LANE: u32 = 129;
-/// Dwords the whole tail takes.
+/// Dwords the whole tail takes (barrier variant: one console wave per
+/// group).
 const SPLIT_TGSM_DWORDS: u32 = 257;
+/// Groups of more than one console wave rendezvous through counters
+/// instead of a group barrier (other console waves may be in divergent
+/// control flow, where a barrier would hang). Per console wave: a
+/// publication counter per half and an arrival counter per half (4
+/// dwords), then the halves' ballot slots, double-buffered by the
+/// exchange parity (4 dwords). Dwords per console wave.
+const SPLIT_RT_DWORDS_PER_WAVE: u32 = 8;
+/// Groups above this many threads stay unsplit for now.
+const SPLIT_MAX_THREADS: u32 = 1024;
 
 struct Lower<'a> {
     s: Shader,
@@ -213,6 +223,10 @@ struct Lower<'a> {
     split_thread: Option<V>,
     /// Split: the block the prelude ended in; values it makes anchor here.
     split_at: usize,
+    /// Split: the group's threads and its console waves (one wave per
+    /// 64 threads; more than one uses the counter rendezvous).
+    split_threads: u32,
+    split_waves: u32,
     /// Split: dwords of the group-shared array the program itself uses;
     /// above them sits the exchange tail ([`SPLIT_COUNTER`] and the slot
     /// groups below it). Program LDS accesses clamp below this.
@@ -384,6 +398,8 @@ impl<'a> Lower<'a> {
         });
         let mut console_lanes = false;
         let mut split = false;
+        let mut split_threads = 0u32;
+        let mut split_waves = 0u32;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -429,22 +445,34 @@ impl<'a> Lower<'a> {
             let wave = if x.native.wave64 { 64 } else { 32 };
             let one_wave = cs.threads.iter().product::<u32>() <= wave;
             // A wave64 program on a 32-lane host splits into two halves
-            // when its group is one console wave; the exchanges keep both
-            // halves whole-wave. LDS shared within one wave is out of
-            // scope (its barrier-free assumption breaks across halves).
+            // per console wave; the exchanges keep both halves whole-wave.
+            // One console wave per group uses group barriers; more waves
+            // rendezvous through counters. LDS shared within one wave is
+            // out of scope (its barrier-free assumption breaks across
+            // halves).
+            let threads = cs.threads.iter().product::<u32>();
             split = x.native.wave64
                 && !x.host_wave64
                 && console_lanes
-                && cs.threads.iter().product::<u32>() <= 64
+                && threads <= SPLIT_MAX_THREADS
                 && cs.lds_bytes() == 0;
+            if split {
+                split_threads = threads;
+                split_waves = threads.div_ceil(64);
+            }
             if console_lanes || one_wave && s.lds_dwords > 0 {
                 s.wave_size = Some(if split { 32 } else { wave });
             }
             if split {
-                // TGSM tail: the claim counter and the exchange slots
-                // (ballots, lane reads, first-lane pairs; see the
-                // SPLIT_* layout constants).
-                s.lds_dwords += SPLIT_TGSM_DWORDS;
+                if threads <= 64 {
+                    // TGSM tail: the claim counter and the exchange slots
+                    // (ballots, lane reads, first-lane pairs; see the
+                    // SPLIT_* layout constants).
+                    s.lds_dwords += SPLIT_TGSM_DWORDS;
+                } else {
+                    let waves = threads.div_ceil(64);
+                    s.lds_dwords += 1 + SPLIT_RT_DWORDS_PER_WAVE * waves;
+                }
             }
         }
         let mut no_barrier = HashSet::new();
@@ -493,7 +521,12 @@ impl<'a> Lower<'a> {
             }
         }
         let split_lds_base = if split {
-            s.lds_dwords - SPLIT_TGSM_DWORDS
+            s.lds_dwords
+                - if split_waves > 1 {
+                    1 + SPLIT_RT_DWORDS_PER_WAVE * split_waves
+                } else {
+                    SPLIT_TGSM_DWORDS
+                }
         } else {
             0
         };
@@ -537,6 +570,8 @@ impl<'a> Lower<'a> {
             split,
             split_thread: None,
             split_at: 0,
+            split_threads,
+            split_waves,
             split_lds_base,
             flat: None,
             no_barrier,
@@ -1978,6 +2013,12 @@ impl<'a> Lower<'a> {
     /// split programs keep one console wave per group, so their control
     /// flow agrees across halves wherever a barrier sits (hazard 2).
     fn split_share(&mut self, slot: u32, mine: V) -> V {
+        if self.split_waves > 1 {
+            // The counter rendezvous; only ballots are exchanged there so
+            // far (lane reads would take the same shape, but none of the
+            // multi-wave groups seen need them yet).
+            return self.split_share_rt(mine);
+        }
         let at = self.cur;
         let lds = self.s.lds();
         let i32t = self.s.t.i32;
@@ -2009,6 +2050,199 @@ impl<'a> Lower<'a> {
     /// Split: like [`split_share`] for a (value, ballot) pair, stored
     /// together under one barrier (`v_readfirstlane_b32` needs both).
     /// The region banks two dwords per lane: [2 * lane, 2 * lane + 1].
+    /// Split, several console waves per group: the halves cannot meet at a
+    /// group barrier (sibling console waves may be in divergent control
+    /// flow, and a barrier would hang them), so they rendezvous through
+    /// counters in their console wave's TGSM region. An elected lane takes
+    /// a publication number (32 per exchange), whose low bit gives the
+    /// exchange parity, stores this exchange's word in this half's
+    /// double-buffered slot, and bumps the half's arrival counter; every
+    /// lane then spins until the partner half's arrival counter reaches
+    /// the same number (bounded: past the bound the wave finishes with its
+    /// own word rather than hanging the GPU), fences, and reads the
+    /// partner's slot. A console wave whose upper half the group size does
+    /// not launch has no partner: the lower half skips the rendezvous and
+    /// reads zeros, which is what an absent half's ballot bits are.
+    fn split_share_rt(&mut self, mine: V) -> V {
+        let i32t = self.s.t.i32;
+        let lds = self.s.lds();
+        let at = self.cur;
+        let base = self.split_lds_base;
+        let waves = self.split_waves;
+        let thread = self.split_thread.expect("split prelude");
+        let z = self.s.m.i32(0);
+        let sh5 = self.s.m.i32(5);
+        let sh6 = self.s.m.i32(6);
+        let one = self.s.m.i32(1);
+        let wave = self.s.m.bin(at, Bin::LShr, thread, sh6);
+        let half = {
+            let t = self.s.m.bin(at, Bin::LShr, thread, sh5);
+            self.s.m.bin(at, Bin::And, t, one)
+        };
+        // This console wave's upper half exists unless it is the last wave
+        // and the group size launches at most the lower half.
+        let outer_guard = if self.split_threads % 64 > 32 {
+            None
+        } else {
+            let last = self.s.m.i32(waves - 1);
+            let is_last = self.s.m.cmp(at, pred::EQ, wave, last);
+            let lower = self.s.m.cmp(at, pred::EQ, half, z);
+            let skip = self.s.m.bin(at, Bin::And, is_last, lower);
+            let t = self.s.m.bool(true);
+            Some(self.s.m.bin(at, Bin::Xor, skip, t))
+        };
+        let outer = self.begin_guarded(outer_guard);
+        let at = self.cur;
+        // TGSM layout from `base`: 1 dword claim counter, then per console
+        // wave a publication and an arrival counter per half, then the
+        // halves' ballot slots double-buffered by exchange parity.
+        let w4 = {
+            let two = self.s.m.i32(2);
+            let t = self.s.m.bin(at, Bin::Shl, wave, two);
+            let one32 = self.s.m.i32(base + 1);
+            self.s.m.bin(at, Bin::Add, t, one32)
+        };
+        let pub_p = self.split_ptr(at, lds, w4, half);
+        let seq_off = self.s.m.i32(2);
+        let seq_idx = self.s.m.bin(at, Bin::Add, seq_off, half);
+        let seq_p = self.split_ptr(at, lds, w4, seq_idx);
+        let elect = self.split_elect(at);
+        let inner = self.begin_guarded(Some(elect));
+        let thirty_two = self.s.m.i32(32);
+        let old = self
+            .s
+            .m
+            .atomic(self.cur, super::bitcode::Rmw::Add, pub_p, thirty_two);
+        // The elected lane's publication number, broadcast to its wave.
+        let old = self.end_guarded(inner, &[(old, z)])[0];
+        let old = self.s.op(
+            self.cur,
+            "waveReadLaneFirst.i32",
+            Attr::NoUnwind,
+            i32t,
+            118,
+            &[old],
+        );
+        // The parity of this exchange: the counter is pre-increment, so
+        // the k-th exchange (zero-based) sees 32 * k.
+        let parity = {
+            let k = self.s.m.bin(self.cur, Bin::LShr, old, sh5);
+            self.s.m.bin(self.cur, Bin::And, k, one)
+        };
+        // The partner's arrival counter reaches 32 * (k + 1) once its
+        // stores are fenced.
+        let target = self.s.m.bin(self.cur, Bin::Add, old, thirty_two);
+        // This half's double-buffered slot: base + 1 + 4 * waves +
+        // 4 * wave + 2 * half + parity.
+        let slot_base = {
+            let four_w = self.s.m.i32(1 + 4 * waves);
+            let four_wave = {
+                let two = self.s.m.i32(2);
+                let t = self.s.m.bin(self.cur, Bin::Shl, wave, two);
+                self.s.m.bin(self.cur, Bin::Add, t, four_w)
+            };
+            let base = self.s.m.i32(base);
+            self.s.m.bin(self.cur, Bin::Add, four_wave, base)
+        };
+        let my_slot = {
+            let two_half = {
+                let one = self.s.m.i32(1);
+                let t = self.s.m.bin(self.cur, Bin::Shl, half, one);
+                self.s.m.bin(self.cur, Bin::Add, t, slot_base)
+            };
+            let idx = self.s.m.bin(self.cur, Bin::Add, two_half, parity);
+            self.s.m.element(self.cur, lds, idx)
+        };
+        // Publish: one elected store, a TGSM fence, then the arrival bump.
+        let elect = self.split_elect(self.cur);
+        let inner = self.begin_guarded(Some(elect));
+        self.s.m.store(self.cur, my_slot, mine);
+        self.end_guarded(inner, &[]);
+        self.tgsm_fence(self.cur);
+        let elect = self.split_elect(self.cur);
+        let inner = self.begin_guarded(Some(elect));
+        let bump = self
+            .s
+            .m
+            .atomic(self.cur, super::bitcode::Rmw::Add, seq_p, thirty_two);
+        self.end_guarded(inner, &[(bump, z)]);
+        // Spin until the partner half's arrival counter reaches the same
+        // number (its stores are then fenced); past the bound, give up and
+        // finish with this half's own word rather than hanging the GPU.
+        let (head, poll, done_b, dead_b, join) = (
+            self.s.m.new_block(),
+            self.s.m.new_block(),
+            self.s.m.new_block(),
+            self.s.m.new_block(),
+            self.s.m.new_block(),
+        );
+        let other_seq = {
+            let one = self.s.m.i32(1);
+            let t = self.s.m.bin(self.cur, Bin::Sub, one, half);
+            let idx = self.s.m.bin(self.cur, Bin::Add, w4, t);
+            let idx = self.s.m.bin(self.cur, Bin::Add, idx, seq_off);
+            self.s.m.element(self.cur, lds, idx)
+        };
+        let entry = self.cur;
+        self.s.m.terminate(entry, Term::Br(head));
+        self.cur = head;
+        let polls = self.s.m.phi(head, i32t);
+        // A plain load could be hoisted out of the spin (the compiler
+        // cannot see the partner half writing it): poll atomically.
+        let seen = self
+            .s
+            .m
+            .atomic(head, super::bitcode::Rmw::Add, other_seq, z);
+        let ok = self.s.m.cmp(head, pred::IUGE, seen, target);
+        self.s.m.terminate(head, Term::CondBr(ok, done_b, poll));
+        self.cur = poll;
+        let inc = self.s.m.bin(poll, Bin::Add, polls, one);
+        let bound = self.s.m.i32(1 << 20);
+        let more = self.s.m.cmp(poll, pred::IULT, inc, bound);
+        self.s.m.terminate(poll, Term::CondBr(more, head, dead_b));
+        self.s.m.set_phi(polls, vec![(z, entry), (inc, poll)]);
+        let t = self.s.m.bool(true);
+        self.s.m.terminate(done_b, Term::Br(join));
+        self.s.m.terminate(dead_b, Term::Br(join));
+        self.cur = join;
+        let dead = self.s.m.phi(join, self.s.t.i1);
+        let f = self.s.m.bool(false);
+        self.s.m.set_phi(dead, vec![(f, done_b), (t, dead_b)]);
+        self.tgsm_fence(join);
+        let other_slot = {
+            let two_half = {
+                let one = self.s.m.i32(1);
+                let t = self.s.m.bin(join, Bin::Sub, one, half);
+                let t = self.s.m.bin(join, Bin::Shl, t, one);
+                self.s.m.bin(join, Bin::Add, t, slot_base)
+            };
+            let idx = self.s.m.bin(join, Bin::Add, two_half, parity);
+            self.s.m.element(join, lds, idx)
+        };
+        let other = self
+            .s
+            .m
+            .atomic(join, super::bitcode::Rmw::Add, other_slot, z);
+        let other = self.s.m.select(join, dead, mine, other);
+        self.end_guarded(outer, &[(other, z)])[0]
+    }
+
+    /// A TGSM fence (without the group sync [`group_barrier`] adds):
+    /// orders the calling thread's group-shared stores before its later
+    /// loads as observed by other threads of the group.
+    fn tgsm_fence(&mut self, at: usize) {
+        let mode = self.s.m.i32(8);
+        let void = self.s.t.void;
+        self.s
+            .op(at, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+    }
+
+    /// A group-shared element pointer: the array plus `w4 + off` dwords.
+    fn split_ptr(&mut self, at: usize, lds: V, w4: V, off: V) -> V {
+        let idx = self.s.m.bin(at, Bin::Add, w4, off);
+        self.s.m.element(at, lds, idx)
+    }
+
     fn split_share_pair(&mut self, slot: u32, a: V, b: V) -> (V, V) {
         let at = self.cur;
         let lds = self.s.lds();
@@ -2090,8 +2324,17 @@ impl<'a> Lower<'a> {
         let one = self.s.m.i32(1);
         let elect = self.s.m.cmp(e, pred::IULT, flat, one);
         let at = self.begin_guarded(Some(elect));
-        let p = slot(self, SPLIT_COUNTER);
-        self.s.m.store(self.cur, p, z);
+        if self.split_waves <= 1 {
+            let p = slot(self, SPLIT_COUNTER);
+            self.s.m.store(self.cur, p, z);
+        } else {
+            // The rendezvous counters: a publication and an arrival
+            // counter per half of every console wave.
+            for i in 0..1 + self.split_waves * 4 {
+                let p = slot(self, i);
+                self.s.m.store(self.cur, p, z);
+            }
+        }
         self.end_guarded(at, &[]);
         self.group_barrier(self.cur);
         // One claim per hardware wave: the lowest active lane is unique.
@@ -7057,9 +7300,12 @@ mod tests {
         let split = lowered(&words, 0, [64, 1, 1], true, false).unwrap();
         assert_eq!(split.wave_size, Some(32));
         assert_ne!(native.dxil, split.dxil);
-        // Two console waves per group: no split (yet).
+        // Two console waves per group split too (the counter rendezvous);
+        // groups past the thread cap do not.
         let wide = lowered(&words, 0, [128, 1, 1], true, false).unwrap();
-        assert_eq!(wide.wave_size, Some(64));
+        assert_eq!(wide.wave_size, Some(32));
+        let huge = lowered(&words, 0, [2048, 1, 1], true, false).unwrap();
+        assert_eq!(huge.wave_size, Some(64));
     }
 
     #[test]

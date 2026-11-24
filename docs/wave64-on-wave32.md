@@ -105,6 +105,25 @@ XCL.
    lane-local mask liveness pass that keeps `v_cmp` + `v_cndmask`
    selectors from being exchanged at all (XCL measured it removing most
    of the remaining overhead).
+   Status: the rendezvous is implemented (`split_share_rt`): per console
+   wave a publication and an arrival counter per half plus double-buffered
+   ballot slots; the parity comes from the publication number (the
+   pre-increment counter value), the spin polls atomically (a plain load
+   can be hoisted out of the loop by the compiler) and is bounded, with a
+   half-local fallback past the bound. A console wave whose upper half the
+   group size does not launch skips the rendezvous and reads zeros.
+   Verified on an RTX 5060 Ti with a 96-thread group (one full console
+   wave exchanging, one 32-thread wave without an upper half): the full
+   wave counts its own 48 of 64 lanes, the partial wave its 32 of 32.
+   Known issue: with two full console waves in one group (128 threads)
+   the exchange between the second wave's halves is wrong on the 5060 Ti
+   even though every address, fence and counter checks out statically —
+   one half reads the partner's slot as 0 after observing the partner's
+   arrival bump, which should be impossible under the seq_cst ordering
+   (the store precedes the bump, fenced). Needs GPU-side debugging
+   (PIX/NSight) or a protocol rework following XCL's single-lane-spin
+   form. Lane reads (`v_readlane`, `v_readfirstlane`) in multi-wave
+   groups are refused for now.
 7. **VS/PS.** Graphics stages get no `WaveSize`; on a 32-lane host a
    wave64 VS/PS runs as a partial wave whose lanes 32..63 are missing
    (XCL's `upper_lanes` data-flow: constants and spill slots for those

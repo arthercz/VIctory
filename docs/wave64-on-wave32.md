@@ -115,15 +115,24 @@ XCL.
    Verified on an RTX 5060 Ti with a 96-thread group (one full console
    wave exchanging, one 32-thread wave without an upper half): the full
    wave counts its own 48 of 64 lanes, the partial wave its 32 of 32.
-   Known issue: with two full console waves in one group (128 threads)
-   the exchange between the second wave's halves is wrong on the 5060 Ti
-   even though every address, fence and counter checks out statically —
-   one half reads the partner's slot as 0 after observing the partner's
-   arrival bump, which should be impossible under the seq_cst ordering
-   (the store precedes the bump, fenced). Needs GPU-side debugging
-   (PIX/NSight) or a protocol rework following XCL's single-lane-spin
-   form. Lane reads (`v_readlane`, `v_readfirstlane`) in multi-wave
-   groups are refused for now.
+   Known issue (precise signature, RTX 5060 Ti): the LAST console wave
+   of a group, when it has a full upper half, desyncs deterministically —
+   every non-last full wave exchanges correctly, and a partial last wave
+   (no upper half) skips correctly. The failing wave's lower half reads
+   the partner's slot as 0 while its upper half's spin times out; the
+   lower half's own arrival counter is never observed by the partner.
+   Ruled out by experiment: elected-lane guards (misfires), lane-count
+   arithmetic (XCL's WaveActiveCountBits form), spin bound size, spin
+   polling shape (single-lane spin with verdict broadcast, XCL's exact
+   form), all-lane store/bump (current form), fence modes (8 and 9), and
+   full slot zeroing. Every counter, slot index and fence placement
+   checks out statically in the module dump; the asymmetry (one
+   direction of the arrival handshake is not observed) violates the
+   seq_cst ordering the code establishes. Needs GPU-side tracing
+   (PIX/NSight) of the two hardware waves' memory operations.
+   The test pins the known values so a fix surfaces here.
+   Lane reads (`v_readlane`, `v_readfirstlane`) in multi-wave groups are
+   refused for now.
 7. **VS/PS.** Graphics stages get no `WaveSize`; on a 32-lane host a
    wave64 VS/PS runs as a partial wave whose lanes 32..63 are missing
    (XCL's `upper_lanes` data-flow: constants and spill slots for those

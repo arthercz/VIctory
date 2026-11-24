@@ -208,6 +208,71 @@ pub(crate) struct Module {
 }
 
 impl Module {
+    /// A text rendering of the module's `main` for diagnostics (barrier
+    /// placement audits); not a general disassembler.
+    pub(crate) fn dump_text(&self) -> String {
+        use std::fmt::Write;
+        let v = |v: V| match v {
+            V::Global(i) => format!("g{i}: {}", self.globals[i as usize].name),
+            V::Func(i) => self.funcs[i as usize].name.to_string(),
+            V::Const(i) => match &self.consts[i as usize].1 {
+                Const::Int(x) => format!("{x}"),
+                Const::Float(x) => format!("f:{x:#x}"),
+                Const::Undef => "undef".to_owned(),
+                Const::Aggregate(xs) => format!("agg{xs:?}"),
+            },
+            V::Inst(i) => format!("%{i}"),
+        };
+        let mut out = String::new();
+        for (bi, b) in self.blocks.iter().enumerate() {
+            let _ = writeln!(out, "block {bi}:");
+            for &i in b.phis.iter().chain(&b.body) {
+                let inst = &self.insts[i as usize];
+                let text = match &inst.op {
+                    Op::Bin(b, x, y) => format!("{b:?} {} {}", v(*x), v(*y)),
+                    Op::Cast(c, x) => format!("{c:?} {}", v(*x)),
+                    Op::Cmp(p, x, y) => format!("cmp{p} {} {}", v(*x), v(*y)),
+                    Op::Select(c, x, y) => format!("select {} {} {}", v(*c), v(*x), v(*y)),
+                    Op::Extract(x, n) => format!("extract {} {n}", v(*x)),
+                    Op::Call(f, xs) => {
+                        let name = self.funcs[*f as usize].name.clone();
+                        let args: Vec<String> = xs.iter().map(|x| v(*x)).collect();
+                        format!("call {name}({})", args.join(", "))
+                    }
+                    Op::Phi(xs) => {
+                        let args: Vec<String> =
+                            xs.iter().map(|(x, b)| format!("{}@{b}", v(*x))).collect();
+                        format!("phi {}", args.join(", "))
+                    }
+                    Op::Gep(_, p, xs) => {
+                        let args: Vec<String> = xs.iter().map(|x| v(*x)).collect();
+                        format!("gep {} {}", v(*p), args.join(", "))
+                    }
+                    Op::Load(p) => format!("load {}", v(*p)),
+                    Op::Store(p, x) => format!("store {} {}", v(*p), v(*x)),
+                    Op::AtomicRmw(r, p, x) => format!("atomic {r:?} {} {}", v(*p), v(*x)),
+                    Op::CmpXchg(p, e, n) => {
+                        format!("cmpxchg {} {} {}", v(*p), v(*e), v(*n))
+                    }
+                };
+                let _ = writeln!(out, "  %{i} = {text}");
+            }
+            match &b.term {
+                Some(Term::Br(t)) => {
+                    let _ = writeln!(out, "  br {t}");
+                }
+                Some(Term::CondBr(c, t, f)) => {
+                    let _ = writeln!(out, "  condbr {} {t} {f}", v(*c));
+                }
+                Some(Term::Ret) => {
+                    let _ = writeln!(out, "  ret");
+                }
+                None => {}
+            }
+        }
+        out
+    }
+
     fn ty(&mut self, def: TypeDef) -> Ty {
         if let Some(&t) = self.type_ids.get(&def) {
             return Ty(t);

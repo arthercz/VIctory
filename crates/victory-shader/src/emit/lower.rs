@@ -223,6 +223,10 @@ struct Lower<'a> {
     split_thread: Option<V>,
     /// Split: the block the prelude ended in; values it makes anchor here.
     split_at: usize,
+    /// Split: the instruction being lowered sits in control flow that can
+    /// diverge between the halves (it has a lane guard). Exchanges, which
+    /// end in a group barrier both halves must reach, are refused there.
+    divergent: bool,
     /// Split: the group's threads and its console waves (one wave per
     /// 64 threads; more than one uses the counter rendezvous).
     split_threads: u32,
@@ -570,6 +574,7 @@ impl<'a> Lower<'a> {
             split,
             split_thread: None,
             split_at: 0,
+            divergent: false,
             split_threads,
             split_waves,
             split_lds_base,
@@ -991,6 +996,11 @@ impl<'a> Lower<'a> {
             self.exit(b)?;
         }
         self.fill_phis()?;
+        // Diagnostics: VICTORY_SPLIT_OPS=<path> dumps the module as text
+        // before it is encoded (barrier placement audits).
+        if let Ok(path) = std::env::var("VICTORY_SPLIT_OPS") {
+            let _ = std::fs::write(path, self.s.m.dump_text());
+        }
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
@@ -1281,6 +1291,16 @@ impl<'a> Lower<'a> {
             // took them to the end of the program's control flow from there.
             Some(&(bx, by, at)) if at == usize::MAX || at == self.cur => (bx, by),
             _ => {
+                if self.split && self.divergent {
+                    // The exchange's barrier is not safe in control flow
+                    // that can diverge between the halves (this instruction
+                    // is lane-guarded or sits in a lane branch): one half
+                    // could reach it alone and wait forever. Drop the
+                    // shader; a rendezvous without a blocking barrier is
+                    // the design's later milestone. (A cached ballot needs
+                    // no new exchange and is fine here.)
+                    return Err("a whole-wave value exchanged in divergent control flow");
+                }
                 // Where the lanes' boolean materializes and the ballot is
                 // taken. A split program takes and exchanges it where the
                 // mask is read: the exchange carries a barrier that must sit
@@ -2106,32 +2126,23 @@ impl<'a> Lower<'a> {
         let seq_off = self.s.m.i32(2);
         let seq_idx = self.s.m.bin(at, Bin::Add, seq_off, half);
         let seq_p = self.split_ptr(at, lds, w4, seq_idx);
-        let elect = self.split_elect(at);
-        let inner = self.begin_guarded(Some(elect));
-        let thirty_two = self.s.m.i32(32);
+        // Every lane bumps the half's publication counter by one (no
+        // elected lane: an elect that misfires on some host wave would
+        // silently drop the bump). The k-th exchange sees pre-increment
+        // values 32 * k .. 32 * k + 31, so the exchange number is old >> 5
+        // for every lane: the parity and the arrival target are uniform.
         let old = self
             .s
             .m
-            .atomic(self.cur, super::bitcode::Rmw::Add, pub_p, thirty_two);
-        // The elected lane's publication number, broadcast to its wave.
-        let old = self.end_guarded(inner, &[(old, z)])[0];
-        let old = self.s.op(
-            self.cur,
-            "waveReadLaneFirst.i32",
-            Attr::NoUnwind,
-            i32t,
-            118,
-            &[old],
-        );
-        // The parity of this exchange: the counter is pre-increment, so
-        // the k-th exchange (zero-based) sees 32 * k.
-        let parity = {
-            let k = self.s.m.bin(self.cur, Bin::LShr, old, sh5);
-            self.s.m.bin(self.cur, Bin::And, k, one)
+            .atomic(self.cur, super::bitcode::Rmw::Add, pub_p, one);
+        let k = self.s.m.bin(self.cur, Bin::LShr, old, sh5);
+        let parity = self.s.m.bin(self.cur, Bin::And, k, one);
+        // The partner's arrival counter reaches 32 * (k + 1) once all its
+        // lanes' stores are fenced.
+        let target = {
+            let kp1 = self.s.m.bin(self.cur, Bin::Add, k, one);
+            self.s.m.bin(self.cur, Bin::Shl, kp1, sh5)
         };
-        // The partner's arrival counter reaches 32 * (k + 1) once its
-        // stores are fenced.
-        let target = self.s.m.bin(self.cur, Bin::Add, old, thirty_two);
         // This half's double-buffered slot: base + 1 + 4 * waves +
         // 4 * wave + 2 * half + parity.
         let slot_base = {
@@ -2153,19 +2164,15 @@ impl<'a> Lower<'a> {
             let idx = self.s.m.bin(self.cur, Bin::Add, two_half, parity);
             self.s.m.element(self.cur, lds, idx)
         };
-        // Publish: one elected store, a TGSM fence, then the arrival bump.
-        let elect = self.split_elect(self.cur);
-        let inner = self.begin_guarded(Some(elect));
+        // Publish: every lane stores the same word (a benign same-value
+        // race, no elected lane), a TGSM fence, then every lane bumps the
+        // arrival counter by one: after all 32 lanes, it reads 32 * (k+1).
         self.s.m.store(self.cur, my_slot, mine);
-        self.end_guarded(inner, &[]);
         self.tgsm_fence(self.cur);
-        let elect = self.split_elect(self.cur);
-        let inner = self.begin_guarded(Some(elect));
-        let bump = self
+        let _ = self
             .s
             .m
-            .atomic(self.cur, super::bitcode::Rmw::Add, seq_p, thirty_two);
-        self.end_guarded(inner, &[(bump, z)]);
+            .atomic(self.cur, super::bitcode::Rmw::Add, seq_p, one);
         // Spin until the partner half's arrival counter reaches the same
         // number (its stores are then fenced); past the bound, give up and
         // finish with this half's own word rather than hanging the GPU.
@@ -2183,12 +2190,17 @@ impl<'a> Lower<'a> {
             let idx = self.s.m.bin(self.cur, Bin::Add, idx, seq_off);
             self.s.m.element(self.cur, lds, idx)
         };
-        let entry = self.cur;
-        self.s.m.terminate(entry, Term::Br(head));
+        // One elected lane polls (32 lanes hammering the partner's counter
+        // with atomic polls starves the partner's own increment on some
+        // hosts); the others take its verdict. A plain load could be
+        // hoisted out of the spin (the compiler cannot see the partner
+        // half writing it), so the poll is an atomic.
+        let elect = self.split_elect(self.cur);
+        let inner = self.begin_guarded(Some(elect));
+        let spin_entry = self.cur;
+        self.s.m.terminate(spin_entry, Term::Br(head));
         self.cur = head;
         let polls = self.s.m.phi(head, i32t);
-        // A plain load could be hoisted out of the spin (the compiler
-        // cannot see the partner half writing it): poll atomically.
         let seen = self
             .s
             .m
@@ -2200,30 +2212,40 @@ impl<'a> Lower<'a> {
         let bound = self.s.m.i32(1 << 20);
         let more = self.s.m.cmp(poll, pred::IULT, inc, bound);
         self.s.m.terminate(poll, Term::CondBr(more, head, dead_b));
-        self.s.m.set_phi(polls, vec![(z, entry), (inc, poll)]);
+        self.s.m.set_phi(polls, vec![(z, spin_entry), (inc, poll)]);
         let t = self.s.m.bool(true);
         self.s.m.terminate(done_b, Term::Br(join));
         self.s.m.terminate(dead_b, Term::Br(join));
         self.cur = join;
-        let dead = self.s.m.phi(join, self.s.t.i1);
+        let dead_in = self.s.m.phi(join, self.s.t.i1);
         let f = self.s.m.bool(false);
-        self.s.m.set_phi(dead, vec![(f, done_b), (t, dead_b)]);
-        self.tgsm_fence(join);
+        self.s.m.set_phi(dead_in, vec![(f, done_b), (t, dead_b)]);
+        let ok_in = self.s.m.bin(join, Bin::Xor, dead_in, t);
+        let ok_v = self.end_guarded(inner, &[(ok_in, t)])[0];
+        let ok32 = self.s.m.cast(self.cur, Cast::ZExt, ok_v, i32t);
+        let first = self.s.op(
+            self.cur,
+            "waveReadLaneFirst.i32",
+            Attr::NoUnwind,
+            i32t,
+            118,
+            &[ok32],
+        );
+        let dead = self.s.m.cmp(self.cur, pred::EQ, first, z);
+        self.tgsm_fence(self.cur);
+        let at = self.cur;
         let other_slot = {
             let two_half = {
                 let one = self.s.m.i32(1);
-                let t = self.s.m.bin(join, Bin::Sub, one, half);
-                let t = self.s.m.bin(join, Bin::Shl, t, one);
-                self.s.m.bin(join, Bin::Add, t, slot_base)
+                let t = self.s.m.bin(at, Bin::Sub, one, half);
+                let t = self.s.m.bin(at, Bin::Shl, t, one);
+                self.s.m.bin(at, Bin::Add, t, slot_base)
             };
-            let idx = self.s.m.bin(join, Bin::Add, two_half, parity);
-            self.s.m.element(join, lds, idx)
+            let idx = self.s.m.bin(at, Bin::Add, two_half, parity);
+            self.s.m.element(at, lds, idx)
         };
-        let other = self
-            .s
-            .m
-            .atomic(join, super::bitcode::Rmw::Add, other_slot, z);
-        let other = self.s.m.select(join, dead, mine, other);
+        let other = self.s.m.atomic(at, super::bitcode::Rmw::Add, other_slot, z);
+        let other = self.s.m.select(at, dead, mine, other);
         self.end_guarded(outer, &[(other, z)])[0]
     }
 
@@ -2774,6 +2796,12 @@ impl<'a> Lower<'a> {
             }
             MaskData::None => false,
         };
+        // Split programs: the two halves must both reach every exchange
+        // (each ends in a group barrier), so they may not sit in control
+        // flow that can diverge between halves: a lane-guarded instruction
+        // or a lane branch's block. The structure pass's per-instruction
+        // guards mark exactly that; set the flag the exchange sites check.
+        self.divergent = self.split && self.x.st.guards[b][i].is_some();
         // Split programs: a lane mask read as data exchanges through the
         // group-shared tail, and the exchange ends in join blocks that
         // follow the current one. Materialize every mask the instruction
@@ -4560,6 +4588,9 @@ impl<'a> Lower<'a> {
                     // wins. A lane in a half that never runs the read is
                     // undefined on the console as well, so a stale slot when
                     // the other half is absent matches the console.
+                    if self.divergent {
+                        return Err("a lane read exchanged in divergent control flow");
+                    }
                     self.cross_lane(false)?;
                     let at = self.cur;
                     let k31 = self.s.m.i32(31);
@@ -4622,6 +4653,9 @@ impl<'a> Lower<'a> {
                     // an active lane, else half 1's. Publish each half's
                     // first-lane value together with its active ballot;
                     // both halves pick the same winner.
+                    if self.divergent {
+                        return Err("a lane read exchanged in divergent control flow");
+                    }
                     let at = self.cur;
                     let i32t = self.s.t.i32;
                     let own =
@@ -7279,10 +7313,79 @@ mod tests {
         })
     }
 
+    /// Diagnostics: translate the container named by
+    /// VICTORY_SPLIT_CONTAINER with the split forced (the module text
+    /// lands in VICTORY_SPLIT_OPS; see `Lower::run`).
+    #[test]
+    fn split_ops_dump_from_env() {
+        let Ok(path) = std::env::var("VICTORY_SPLIT_CONTAINER") else {
+            return;
+        };
+        let bytes = std::fs::read(path).unwrap();
+        let c = crate::Container::parse(&bytes).unwrap();
+        let dxil = c.part(crate::FourCC::DXIL).unwrap();
+        let native = crate::native_programs(dxil.data)
+            .unwrap()
+            .into_iter()
+            .find(|p| p.stage == HwStage::Cs)
+            .unwrap();
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            host_wave64: false,
+            mesh_stride: 0,
+        })
+        .unwrap();
+    }
+
     /// A wave64 program whose group is one console wave (64 threads)
     /// lowers to WaveSize 32 with the split form when the host has no
     /// 64-lane waves, and keeps WaveSize 64 otherwise. A group of two
     /// console waves does not split.
+    #[test]
+    fn split_check_env_dumped_container() {
+        // Throwaway: SPLIT_CHECK_DXBC=<file> lowers a dumped container with
+        // the split active, printing whether it lowers or is refused.
+        let Ok(path) = std::env::var("SPLIT_CHECK_DXBC") else {
+            return;
+        };
+        let bytes = std::fs::read(&path).unwrap();
+        let c = crate::Container::parse(&bytes).unwrap();
+        let dxil = c.part(crate::FourCC::DXIL).unwrap();
+        for p in crate::native_programs(&dxil.data).unwrap() {
+            let program = crate::ir::build(&p.patched_code(), p.wave64, p.vgprs).unwrap();
+            let st = crate::structure::structure(&program).unwrap();
+            let res = crate::resource::track(&program, &p.layout, p.stage).unwrap();
+            let io = crate::io::raise(&program, &p).unwrap();
+            let r = lower(&Parts {
+                native: &p,
+                p: &program,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+                host_wave64: false,
+            });
+            match r {
+                Ok(_) => println!("LOWERED OK"),
+                Err(e) => println!("REJECTED: {e}"),
+            }
+        }
+    }
+
     #[test]
     fn wave64_splits_when_the_host_has_no_64_lane_waves() {
         // v_cmp_lt_u32 vcc, v0, 48; s_bcnt1_i32_b64 s10, vcc; endpgm. The

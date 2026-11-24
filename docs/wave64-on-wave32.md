@@ -1,6 +1,10 @@
 # Wave64 console programs on 32-lane host waves
 
-Status: design, no code yet. Tracks the NVIDIA/Intel class of hosts
+Status: milestones 1-4 implemented (mode selection, entry remap, ballot
+exchange, lane reads), validated end-to-end on a 32-lane host (RDNA2) by
+`emit::valu_tests::wave64_split_*`. Milestones 5-7 (coherent scalar loads,
+multi-wave groups, VS/PS upper lanes) and `ds_bpermute` (unsupported
+everywhere today) remain. Tracks the NVIDIA/Intel class of hosts
 (`D3D12_FEATURE_DATA_D3D12_OPTIONS1.WaveLaneCountMax < 64`), where a
 `[WaveSize(64)]` compute shader is refused at PSO creation and every
 wave64 program of the title is dropped today. The reference for the
@@ -64,11 +68,15 @@ the console.
 
 ## TGSM budget
 
-Per group: one 32-bit counter plus, per parity (double-buffered) and
-half, the widest slot (1 word for ballots and lane reads, 32 for
-`ds_bpermute`, 16 for wide coherent scalar loads). Program LDS accesses
-are offset below the reserved tail; a program using the whole 32 KB LDS
-loses its top dwords, as in XCL.
+Per group: one 32-bit counter plus a per-lane bank for each exchange
+region (a word per lane for ballots and lane reads, two for first-lane
+pairs). Every exchanged value is uniform across a hardware wave, so each
+lane stores its own slot unguarded — predicated-off lanes store too, no
+slot goes stale across barriers or loop iterations, and no zeroing or
+double-buffering is needed. The counter keeps the elected-lane claim
+from the prelude. Program LDS accesses are offset below the reserved
+tail; a program using the whole 32 KB LDS loses its top dwords, as in
+XCL.
 
 ## Emitter changes, by milestone
 

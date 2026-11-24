@@ -78,14 +78,17 @@ fn build_cs(body: &[u32], wave64: bool, threads: [u32; 3], host_wave64: bool) ->
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
-    words.extend_from_slice(&s_load_dwordx4(8, 4));
+    // The descriptor sits at s[12:15]: wave64 programs keep VCC at s[6:7]
+    // and scalarized results (v_readlane's destination) above it, and a
+    // write into the descriptor's registers after the load is refused.
+    words.extend_from_slice(&s_load_dwordx4(12, 4));
     // Copy root constants s0..s3 into v1..v4 so VALU instructions operate on
     // VGPRs just as they do in real shaders.
     for i in 0..4u8 {
         words.push(vop1(0x001, i + 1, sgpr(i))); // v_mov_b32
     }
     words.extend_from_slice(body);
-    words.extend_from_slice(&buffer_store_dword(0, 8, 0));
+    words.extend_from_slice(&buffer_store_dword(0, 12, 0));
     words.push(S_ENDPGM);
 
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
@@ -268,6 +271,137 @@ fn wave64_split_counts_console_lanes_across_halves() {
             assert!(ran > 0, "split: no SM 6.6 device available");
         }
     }
+}
+
+/// Runs a split-form wave64 shader (the milestone-1 lowering for hosts
+/// without 64-lane waves) on every SM 6.6 device with at least 32-lane
+/// waves. WARP runs 4-lane waves, for which halves of 32 are impossible;
+/// such devices skip. `check(label, case, inputs, result)` asserts.
+fn run_split_cases(
+    shader: &HostShader,
+    cases: &[[u32; 4]],
+    mut check: impl FnMut(&str, usize, [u32; 4], u32),
+) {
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            continue;
+        };
+        if host.wave_lanes() < 32 {
+            eprintln!(
+                "{label}: {} lanes; split needs 32; skipped",
+                host.wave_lanes()
+            );
+            continue;
+        }
+        let (root, pso) = host
+            .compute_pipeline(shader)
+            .unwrap_or_else(|e| panic!("{label}: split form refused: {e}"));
+        for (i, &inputs) in cases.iter().enumerate() {
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                ud[u.index as usize] = match (u.root, u.slot) {
+                    (RootType::Constants, 0) => inputs[u.dword as usize],
+                    (RootType::Table, 1) => 0,
+                    other => panic!("unexpected user data {other:?}"),
+                };
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[View::RawUav(1)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: dispatch: {e}"));
+            check(label, i, inputs, out[0][0]);
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "no SM 6.6 device with 32-lane waves available");
+}
+
+/// `v0 = this lane's console thread index` (lanes 0..63 of one console
+/// wave): an all-ones mask through both halves of `v_mbcnt`.
+fn lane_id_body() -> Vec<u32> {
+    let mut body = Vec::new();
+    // v_mov_b32 v5, 0xFFFFFFFF (literal follows the 0xFF marker).
+    body.push(vop1(0x001, 5, 0xFF));
+    body.push(u32::MAX);
+    // v_mbcnt_hi_u32_b32 v6, v5, 0: ones below the console lane in the
+    // mask's high half (zero for lanes 0..31).
+    body.extend_from_slice(&vop3(0x366, 6, vgpr(5), 0x80, 0x80));
+    // v_mbcnt_lo_u32_b32 v0, v5, v6: plus the low half's ones below it.
+    body.extend_from_slice(&vop3(0x365, 0, vgpr(5), vgpr(6), 0x80));
+    body
+}
+
+/// Split `v_readlane_b32`: a wave64 program reads lane `k` (a root
+/// constant, so uniform — the console takes the lane from an SGPR) of a
+/// register holding each lane's console index. On a 32-lane host the two
+/// halves exchange the read; lanes of the owner half come from the other
+/// half's slot. `k` at and across 32 exercises both halves.
+#[test]
+fn wave64_split_readlane_uses_the_owner_half() {
+    let mut body = lane_id_body();
+    // v_readlane_b32 s10, v0, s0 (VOP3 0x360): lane s0's console index. The
+    // decoder takes readlane's destination as an SGPR (its use is
+    // scalarization); move it back to v0 for the store.
+    body.extend_from_slice(&vop3(0x360, 10, vgpr(0), sgpr(0), 0x80));
+    body.push(vop1(0x001, 0, sgpr(10)));
+    let shader = build_cs(&body, true, [64, 1, 1], false);
+    let cases: &[[u32; 4]] = &[
+        [0, 0, 0, 0],
+        [1, 0, 0, 0],
+        [31, 0, 0, 0],
+        [32, 0, 0, 0],
+        [33, 0, 0, 0],
+        [63, 0, 0, 0],
+    ];
+    run_split_cases(&shader, cases, |backend, i, inp, got| {
+        assert_eq!(got, inp[0], "{backend} case {i}: readlane at {}", inp[0]);
+    });
+}
+
+/// Split `v_writelane_b32` + `v_readlane_b32`: lane `k` takes the value
+/// (a root constant), then the wave reads lane `k` back. The write lands
+/// in the owner half only; the read must see it across the halves.
+#[test]
+fn wave64_split_writelane_is_seen_across_halves() {
+    let mut body = lane_id_body();
+    // v_writelane_b32 v0, s1, s0 (VOP3 0x361): lane s0 takes s1.
+    body.extend_from_slice(&vop3(0x361, 0, sgpr(1), sgpr(0), 0x80));
+    // v_readlane_b32 s10, v0, s0: read lane s0 back, then s10 -> v0.
+    body.extend_from_slice(&vop3(0x360, 10, vgpr(0), sgpr(0), 0x80));
+    body.push(vop1(0x001, 0, sgpr(10)));
+    let shader = build_cs(&body, true, [64, 1, 1], false);
+    let cases: &[[u32; 4]] = &[
+        [0, 99, 0, 0],
+        [31, 99, 0, 0],
+        [32, 99, 0, 0],
+        [63, 99, 0, 0],
+    ];
+    run_split_cases(&shader, cases, |backend, i, inp, got| {
+        assert_eq!(got, inp[1], "{backend} case {i}: writelane {}", inp[0]);
+    });
+}
+
+/// Split `v_readfirstlane_b32`: the value of the console's lowest active
+/// lane (lane 0 of 64 active threads), exchanged as a (value, active
+/// ballot) pair so both halves pick the same half's word.
+#[test]
+fn wave64_split_readfirstlane_picks_console_lane_zero() {
+    let mut body = lane_id_body();
+    // v_readfirstlane_b32 v0, v0 (VOP1 0x002).
+    body.push(vop1(0x002, 0, vgpr(0)));
+    let shader = build_cs(&body, true, [64, 1, 1], false);
+    run_split_cases(&shader, &[[0, 0, 0, 0]], |backend, _, _, got| {
+        assert_eq!(got, 0, "{backend}: readfirstlane of console lane ids");
+    });
 }
 
 fn is_f16_nan(bits: u16) -> bool {

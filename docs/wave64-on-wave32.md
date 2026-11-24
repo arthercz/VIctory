@@ -115,28 +115,23 @@ XCL.
    Verified on an RTX 5060 Ti with a 96-thread group (one full console
    wave exchanging, one 32-thread wave without an upper half): the full
    wave counts its own 48 of 64 lanes, the partial wave its 32 of 32.
-   Known issue (precise signature, RTX 5060 Ti): the LAST console wave
-   of a group, when it has a full upper half, desyncs deterministically —
-   every non-last full wave exchanges correctly, and a partial last wave
-   (no upper half) skips correctly. The failing wave's lower half reads
-   the partner's slot as 0 while its upper half's spin times out; the
-   lower half's own arrival counter is never observed by the partner.
-   Ruled out by experiment: elected-lane guards (misfires), lane-count
-   arithmetic (XCL's WaveActiveCountBits form), spin bound size, spin
-   polling shape (single-lane spin with verdict broadcast, XCL's exact
-   form), all-lane store/bump (current form), fence modes (8 and 9), and
-   full slot zeroing, and plain vs atomic (xchg) exchange stores.
-   Every counter, slot index and fence placement
-   checks out statically in the module dump; the asymmetry (one
-   direction of the arrival handshake is not observed) violates the
-   seq_cst ordering the code establishes. Needs GPU-side tracing
-   (PIX/NSight) of the two hardware waves' memory operations.
-   The remaining hypothesis space needs GPU-side memory tracing: the
-   failing half's ballot reads back as 0 through the exchange even
-   though its inputs (thread ids, lane-in-wave values) probe correct,
-   which points at the waveActiveBallot or the TGSM store path of the
-   last-scheduled hardware wave rather than at the protocol.
-   The test pins the known values so a fix surfaces here.
+   Fixed: the last-full-wave desync was a guard-condition bug, not a
+   protocol race. The skip guard (a console wave whose upper half the
+   group size does not launch skips the rendezvous) was emitted whenever
+   threads % 64 <= 32, which includes groups with NO partial wave at
+   all: the last full wave's lower half skipped its exchange, and its
+   upper half timed out waiting for a partner that never arrived. The
+   decisive experiment was XCL's arrival-counter rendezvous compiled
+   from HLSL by DXC 1.9 and run through our dispatch harness on the
+   same GPU: it exchanged correctly in every console wave, proving the
+   protocol and hardware sound and pointing at our emission. The guard
+   now applies only when the last wave is partial AND has at most 32
+   threads. Verified on the RTX 5060 Ti with 96/128/192/256-thread
+   groups: every full console wave counts its own 48 of 64 lanes, the
+   96-thread group's 32-thread wave counts its 32 of 32. The
+   192-thread group's 64-thread last wave works as well (both its
+   halves). Cross-check shader: `xcl_hlsl_exchange_on_this_gpu`
+   (ignored, needs the out-of-tree HLSL build).
    Lane reads (`v_readlane`, `v_readfirstlane`) in multi-wave groups are
    refused for now.
 7. **VS/PS.** Graphics stages get no `WaveSize`; on a 32-lane host a

@@ -999,7 +999,7 @@ fn wave64_split_rendezvous_counts_per_console_wave() {
         0x80 << 24 | ((12 >> 2) & 0x1F) << 16 | 2 << 8 | 1,
         S_ENDPGM,
     ];
-    for threads in [96u32, 128] {
+    for threads in [96u32, 128, 192, 256] {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let native = NativeProgram {
             stage: HwStage::Cs,
@@ -1072,6 +1072,11 @@ fn wave64_split_rendezvous_counts_per_console_wave() {
             v.validate(&mut copy)
                 .unwrap_or_else(|e| panic!("{threads}t: DXIL validation: {e}"));
         }
+        std::fs::write(
+            format!("F:/VIctory/target/ours_{threads}.dxil"),
+            &shader.dxil,
+        )
+        .unwrap();
         let mut ran = 0;
         for (backend, warp) in [("hardware", false), ("warp", true)] {
             let Ok(host) = Host::new(warp) else { continue };
@@ -1086,7 +1091,7 @@ fn wave64_split_rendezvous_counts_per_console_wave() {
                     &pso,
                     &Dispatch {
                         roots: vec![(0, Root::Constants(ud))],
-                        views: &[View::RawUav(128)],
+                        views: &[View::RawUav(256)],
                         samplers: &[],
                         groups: [1, 1, 1],
                     },
@@ -1101,18 +1106,79 @@ fn wave64_split_rendezvous_counts_per_console_wave() {
                 assert_eq!(out[0][64], 32, "{backend} {threads}t thread 64");
                 assert_eq!(out[0][95], 32, "{backend} {threads}t thread 95");
             }
-            // KNOWN ISSUE: the last console wave of a group, when it has a
-            // full upper half, desyncs on the RTX 5060 Ti: its lower half
-            // reads the partner's slot as 0 and its upper half's spin
-            // times out, although every counter, slot index and fence
-            // checks out statically (docs/wave64-on-wave32.md). Asserted
-            // here so a fix turns the build red... in the other direction.
-            if threads == 128 {
-                assert_eq!(out[0][64], 32, "{backend} known-issue thread 64");
-                assert_eq!(out[0][96], 32, "{backend} known-issue thread 96");
+            if threads >= 128 {
+                // Every full console wave counts its own 48; the
+                // 192-thread group has a partial last wave (64 threads,
+                // both halves: 48 of them below 48).
+                for t in [64usize, 96, 127] {
+                    assert_eq!(out[0][t], 48, "{backend} {threads}t thread {t}");
+                }
+                let last = (threads - 1) as usize;
+                assert_eq!(
+                    out[0][last],
+                    if threads % 64 == 0 { 48 } else { 48 },
+                    "{backend} {threads}t thread {last}"
+                );
+                assert_eq!(
+                    out[0][last - 31],
+                    48,
+                    "{backend} {threads}t thread {}",
+                    last - 31
+                );
             }
             ran += 1;
         }
         assert!(ran > 0, "{threads}t: no SM 6.6 device with 32-lane waves");
     }
+}
+
+/// DECISIVE EXPERIMENT (temporary): XCL's arrival-counter rendezvous,
+/// compiled from HLSL by DXC 1.9, run through our dispatch harness on the
+/// same GPU where our DXIL-form exchange desyncs in the last console wave.
+/// If this passes, the bug is in our emission, not the protocol or driver.
+#[test]
+#[ignore]
+fn xcl_hlsl_exchange_on_this_gpu() {
+    // Cross-check against XCL's arrival-counter rendezvous compiled from
+    // HLSL by DXC 1.9 (the experiment that pinned the guard-condition bug
+    // in this file's exchange: XCL's form worked where ours desynced).
+    // Needs the shader built out of tree; skips without it.
+    let Ok(dxil) = std::fs::read("F:/VIctory/target/xcl_exchange.dxil") else {
+        eprintln!("xcl_exchange.dxil not built; skipped");
+        return;
+    };
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil,
+        user_data: Vec::new(),
+        samplers: Vec::new(),
+        static_samplers: Vec::new(),
+        root_cbvs: Vec::new(),
+        root_srvs: Vec::new(),
+    };
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no hardware device; skipped");
+        return;
+    };
+    let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(vec![0u32]))],
+                views: &[View::RawUav(256)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .expect("dispatch");
+    eprintln!(
+        "xcl-hlsl: 0={} 32={} 64={} 96={} 127={}",
+        out[0][0], out[0][32], out[0][64], out[0][96], out[0][127]
+    );
+    assert_eq!(out[0][0], 48, "wave0 half0");
+    assert_eq!(out[0][64], 48, "wave1 half0");
+    assert_eq!(out[0][96], 48, "wave1 half1");
+    assert_eq!(out[0][127], 48, "wave1 half1 last");
 }

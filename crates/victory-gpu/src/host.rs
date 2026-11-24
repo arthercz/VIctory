@@ -615,6 +615,7 @@ impl Host {
             }
             #[cfg(feature = "diagnostics")]
             if crate::profile::on() {
+                // SAFETY: a plain query on the live queue.
                 let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
                 let pipes = {
                     let p = runs[i].pipelines.lock().unwrap_or_else(|e| e.into_inner());

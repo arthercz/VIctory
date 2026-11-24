@@ -314,6 +314,12 @@ pub struct Structured {
     /// they are written: every such lane reaches the writing block, so a
     /// ballot there gives the mask as data.
     pub active: HashSet<Value>,
+    /// Per block: the block is reached only under a lane-varying
+    /// condition (a lane branch's region). DXIL control flow there
+    /// diverges between lanes, so a group barrier (a split program's
+    /// whole-wave exchange) is not safe in it — even for a scalar
+    /// instruction, whose `guards` entry is always `None`.
+    pub lane_blocks: Vec<bool>,
 }
 
 /// Builds the per-lane form of `program`.
@@ -558,6 +564,14 @@ impl<'a> Lanes<'a> {
                     .collect()
             })
             .collect();
+        let lane_blocks = blocks
+            .iter()
+            .enumerate()
+            .map(|(n, _)| {
+                let c = cond[n];
+                c != Bool::TRUE && b.support(c).iter().any(|a| !matches!(a, Atom::Uniform(_)))
+            })
+            .collect();
         let exits = blocks
             .iter()
             .enumerate()
@@ -587,6 +601,7 @@ impl<'a> Lanes<'a> {
             bools: self.b,
             exits,
             guards,
+            lane_blocks,
         })
     }
 

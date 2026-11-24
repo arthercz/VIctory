@@ -1282,6 +1282,13 @@ impl<'a> Lower<'a> {
             None => (v, false),
         };
         let &m = self.x.st.masks.get(&lo).ok_or(LANE_MASK)?;
+        if m == Bool::TRUE || m == Bool::FALSE {
+            // A statically known mask: both words are the same constant, so
+            // no ballot — and in a split program no exchange either (its
+            // barrier could sit in divergent control flow, and a constant
+            // needs no whole-wave agreement).
+            return Ok(self.s.m.i32(if m == Bool::TRUE { u32::MAX } else { 0 }));
+        }
         if !self.x.st.active.contains(&lo) {
             return Err("a lane mask holding lanes elsewhere read as data");
         }
@@ -1291,7 +1298,10 @@ impl<'a> Lower<'a> {
             // took them to the end of the program's control flow from there.
             Some(&(bx, by, at)) if at == usize::MAX || at == self.cur => (bx, by),
             _ => {
-                if self.split && self.divergent {
+                if self.split
+                    && self.divergent
+                    && std::env::var_os("VICTORY_SPLIT_ALLOW_DIVERGENT").is_none()
+                {
                     // The exchange's barrier is not safe in control flow
                     // that can diverge between the halves (this instruction
                     // is lane-guarded or sits in a lane branch): one half
@@ -2101,7 +2111,15 @@ impl<'a> Lower<'a> {
         };
         // This console wave's upper half exists unless it is the last wave
         // and the group size launches at most the lower half.
-        let outer_guard = if self.split_threads % 64 > 32 {
+        // The skip applies only when the last console wave is a partial
+        // one of at most 32 threads: then it has no upper half to meet.
+        // A group size that is a multiple of 64 has no partial wave at
+        // all, and a partial wave of more than 32 threads has both
+        // halves. Emitting the guard otherwise would skip the last full
+        // wave's rendezvous and strand its upper half (the RTX 5060 Ti
+        // showed exactly that: the last wave's halves desynced).
+        let partial = self.split_threads % 64;
+        let outer_guard = if partial == 0 || partial > 32 {
             None
         } else {
             let last = self.s.m.i32(waves - 1);
@@ -2804,10 +2822,14 @@ impl<'a> Lower<'a> {
         };
         // Split programs: the two halves must both reach every exchange
         // (each ends in a group barrier), so they may not sit in control
-        // flow that can diverge between halves: a lane-guarded instruction
-        // or a lane branch's block. The structure pass's per-instruction
-        // guards mark exactly that; set the flag the exchange sites check.
-        self.divergent = self.split && self.x.st.guards[b][i].is_some();
+        // flow that can diverge between lanes: a lane branch's block, or
+        // (for a vector instruction) one narrowed per instruction. Scalar
+        // instructions carry no guard but a lane branch's block still
+        // diverges for them; the structure pass's per-block conditions
+        // mark exactly that. Set the flag the exchange sites check.
+        self.divergent = self.split
+            && (self.x.st.lane_blocks.get(b).copied().unwrap_or(false)
+                || self.x.st.guards[b][i].is_some());
         // Split programs: a lane mask read as data exchanges through the
         // group-shared tail, and the exchange ends in join blocks that
         // follow the current one. Materialize every mask the instruction
@@ -4594,7 +4616,8 @@ impl<'a> Lower<'a> {
                     // wins. A lane in a half that never runs the read is
                     // undefined on the console as well, so a stale slot when
                     // the other half is absent matches the console.
-                    if self.divergent {
+                    if self.divergent && std::env::var_os("VICTORY_SPLIT_ALLOW_DIVERGENT").is_none()
+                    {
                         return Err("a lane read exchanged in divergent control flow");
                     }
                     self.cross_lane(false)?;
@@ -4659,7 +4682,8 @@ impl<'a> Lower<'a> {
                     // an active lane, else half 1's. Publish each half's
                     // first-lane value together with its active ballot;
                     // both halves pick the same winner.
-                    if self.divergent {
+                    if self.divergent && std::env::var_os("VICTORY_SPLIT_ALLOW_DIVERGENT").is_none()
+                    {
                         return Err("a lane read exchanged in divergent control flow");
                     }
                     let at = self.cur;
@@ -7352,6 +7376,68 @@ mod tests {
             mesh_stride: 0,
         })
         .unwrap();
+    }
+
+    /// A split program that reads a statically known mask as data needs
+    /// no ballot (and no exchange with its group barrier): the words are
+    /// constants.
+    #[test]
+    fn wave64_split_folds_a_constant_mask_read() {
+        let words = [
+            0x7D88_00FF,
+            48,          // v_cmp_gt_u32 vcc, 48, v0
+            0x878A_806A, // s_and_b64 s[10:11], vcc, 0: a constant mask
+            0xBE8C_100A, // s_bcnt1_i32_b64 s12, s[10:11]: read as data
+            S_ENDPGM,
+        ];
+        let split = lowered(&words, 0, [64, 1, 1], true, false).unwrap();
+        assert_eq!(split.wave_size, Some(32));
+        assert!(
+            !split
+                .dxil
+                .windows(b"waveActiveBallot".len())
+                .any(|w| w == b"waveActiveBallot"),
+            "a constant mask was balloted"
+        );
+    }
+
+    /// A split program that reads a lane mask as data inside a lane
+    /// branch's block is refused: the exchange's group barrier would sit
+    /// in control flow that diverges between lanes and could wait forever.
+    #[test]
+    fn wave64_split_refuses_an_exchange_in_a_lane_branch() {
+        // The arm's `s_bcnt` reads vcc as data and sets SCC, which the
+        // next branch's condition then reads: the refusal surfaces there
+        // (a dead `s_bcnt` would be forgiven as a missing value).
+        let words = [
+            0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+            0xBE80_246A, // s_and_saveexec_b64 s[0:1], vcc
+            0xBF88_0002, // s_cbranch_execz -> 20 (the restore)
+            0xBE8A_106A, // s_bcnt1_i32_b64 s10, vcc (in the arm)
+            0xBF85_0001, // s_cbranch_scc1 -> 24 (reads the bcnt's SCC)
+            0x88FE_7E00, // 20: s_or_b64 exec, exec, s[0:1]
+            S_ENDPGM,
+        ];
+        let err = match lowered(&words, 0, [64, 1, 1], true, false) {
+            Ok(_) => {
+                let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+                let p = ir::build(&code, true, 256).unwrap();
+                let st = structure::structure(&p).unwrap();
+                let names: Vec<_> = p
+                    .blocks
+                    .iter()
+                    .flat_map(|b| b.insts.iter().map(|i| i.name()))
+                    .collect();
+                panic!(
+                    "translated; insts {names:?} exits {:?} lane {:?}",
+                    st.exits, st.lane_blocks
+                );
+            }
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("divergent control flow"), "{err}");
+        // Without the split the same program translates.
+        lowered(&words, 0, [64, 1, 1], true, true).unwrap();
     }
 
     /// A wave64 program whose group is one console wave (64 threads)

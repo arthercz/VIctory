@@ -874,3 +874,105 @@ fn bfe_signed_and_unsigned_match_rdna2() {
         );
     });
 }
+
+/// The hand-encoded loop in `bench_split_exchange_overhead` must trip
+/// `n` times, not run to the translated loop's abort limit.
+#[test]
+fn hand_encoded_loop_trips_n_times() {
+    let n = 262_144u32;
+    let mut body = vec![0xBE90_0380]; // s_mov_b32 s16, 0
+    body.extend_from_slice(&vop3(0x003, 5, vgpr(5), 0xFF, 0x80)); // v_add_f32 v5, v5, 1.0
+    body.push(0x3F80_0000);
+    body.push(0x8010_8110); // s_add_u32 s16, s16, 1
+    body.extend_from_slice(&[0xBF0A_FF10, n]); // s_cmp_lt_u32 s16, n
+    let imm = 1i32 - (body.len() as i32 + 1);
+    body.push(0xBF85_0000 | (imm as u16 as u32)); // s_cbranch_scc1 loop
+    // build_cs stores v0: the loop count leaves through it.
+    body.push(vop1(0x001, 0, sgpr(16))); // v_mov_b32 v0, s16
+    // The wave32 form runs on any host: it isolates the hand encoding from
+    // the split lowering.
+    let shader = build_cs(&body, false, [32, 1, 1], true);
+    run_cases(&shader, &[[0, 0, 0, 0]], |backend, _, _, got| {
+        assert_eq!(got, n, "{backend}: loop trip count");
+    });
+    // The split form: same program, wave64 on a 32-lane host.
+    let shader = build_cs(&body, true, [64, 1, 1], false);
+    run_split_cases(&shader, &[[0, 0, 0, 0]], |backend, _, _, got| {
+        assert_eq!(got, n, "{backend}: loop trip count");
+    });
+}
+
+/// The split form's cost on a 32-lane host, in the style of XCL's
+/// `bench_split_wave64`: one console wave per group runs a 1024-iteration
+/// dependent FMA chain, with or without one mask-as-data read (a ballot
+/// exchange) per iteration. Prints the per-dispatch medians and the ratio;
+/// ignored like XCL's benchmark, run explicitly:
+/// `cargo test --features host -- --ignored bench_split_exchange_overhead`.
+#[test]
+#[ignore]
+fn bench_split_exchange_overhead() {
+    let n = 262_144u32;
+    let mut plain = vec![0xBE90_0380]; // s_mov_b32 s16, 0
+    let mut exchanging = plain.clone();
+    for body in [&mut plain, &mut exchanging] {
+        // loop: v_add_f32 v5, v5, 1.0f
+        body.extend_from_slice(&vop3(0x003, 5, vgpr(5), 0xFF, 0x80));
+        body.push(0x3F80_0000);
+    }
+    // One mask read as data per iteration: v_cmp_gt_u32 vcc, 1.0f, v5;
+    // s_bcnt1_i32_b64 s17, vcc.
+    exchanging.extend_from_slice(&[0x7D88_0AFF, 0x3F80_0000, 0xBE91_106A]);
+    for body in [&mut plain, &mut exchanging] {
+        body.push(vop1(0x001, 0, vgpr(5))); // v_mov_b32 v0, v5: the chain escapes
+        body.push(0x8010_8110); // s_add_u32 s16, s16, 1
+        body.extend_from_slice(&[0xBF0A_FF10, n]); // s_cmp_lt_u32 s16, n
+        // s_cbranch_scc1 back to the loop's first word (index 1): the
+        // imm16 is the signed word offset from the instruction after the
+        // branch.
+        let imm = 1i32 - (body.len() as i32 + 1);
+        body.push(0xBF85_0000 | (imm as u16 as u32));
+    }
+
+    let plain = build_cs(&plain, true, [64, 1, 1], false);
+    let exchanging = build_cs(&exchanging, true, [64, 1, 1], false);
+
+    let bench = |shader: &HostShader, host: &Host| -> f64 {
+        let (root, pso) = host.compute_pipeline(shader).expect("pipeline");
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let run = || {
+            let t = std::time::Instant::now();
+            for _ in 0..16 {
+                host.dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud.clone()))],
+                        views: &[View::RawUav(1)],
+                        samplers: &[],
+                        groups: [32, 32, 1],
+                    },
+                )
+                .expect("dispatch");
+            }
+            t.elapsed().as_secs_f64() / 16.0 * 1e3
+        };
+        run(); // warm up
+        let mut times = [run(), run(), run()];
+        times.sort_by(f64::total_cmp);
+        times[1]
+    };
+
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else { continue };
+        if host.wave_lanes() < 32 {
+            eprintln!("{label}: {} lanes; skipped", host.wave_lanes());
+            continue;
+        }
+        let p = bench(&plain, &host);
+        let x = bench(&exchanging, &host);
+        eprintln!(
+            "{label}: plain {p:.3} ms, 1 exchange/iter {x:.3} ms, ratio {:.2}x",
+            x / p
+        );
+    }
+}

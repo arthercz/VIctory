@@ -72,6 +72,8 @@
 *.rar
 
 # Editor / OS noise
+__pycache__/
+*.py[cod]
 .vs/
 .idea/
 *.swp

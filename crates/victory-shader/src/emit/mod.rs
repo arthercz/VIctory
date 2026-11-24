@@ -120,6 +120,24 @@ pub fn loop_limit() -> u32 {
     })
 }
 
+/// Whether the host GPU runs 64-lane waves. Set once from the host
+/// device's `D3D12_FEATURE_DATA_D3D12_OPTIONS1` before pipelines are made;
+/// translation reads it. It is part of the translation, so the shader
+/// cache must key on it (`victory-gpu`'s build fingerprint does).
+///
+/// Unset means every wave size runs: the historical behavior, and what
+/// tests get unless they pass [`lower::Parts::host_wave64`] explicitly.
+pub fn host_wave64() -> bool {
+    *HOST_WAVE64.get_or_init(|| true)
+}
+
+/// Records the host device's wave capability; the first call wins.
+pub fn set_host_wave64(wave64: bool) {
+    let _ = HOST_WAVE64.set(wave64);
+}
+
+static HOST_WAVE64: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
 /// unreadable or 0. Pure, for testing.
 fn parse_loop_limit(value: Option<&str>) -> u32 {
@@ -276,6 +294,7 @@ pub fn emit(
         outputs,
         prims,
         mesh_stride,
+        host_wave64: host_wave64(),
     })?;
     Ok(HostShader {
         stage: native.stage,

@@ -98,6 +98,22 @@ impl Host {
         }
     }
 
+    /// The device's maximum wave lane count (`D3D12_OPTIONS1`).
+    pub fn wave_lanes(&self) -> u32 {
+        // SAFETY: the query writes the structure of the given size.
+        unsafe {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+            self.device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS1,
+                    (&raw mut options).cast(),
+                    size_of_val(&options) as u32,
+                )
+                .ok();
+            options.WaveLaneCountMax
+        }
+    }
+
     /// The root signature translated shaders expect: user data per stage
     /// at `b0`, immediate samplers per stage at `s<n>`, heaps directly
     /// indexed.

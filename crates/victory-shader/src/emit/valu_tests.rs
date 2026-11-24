@@ -69,6 +69,12 @@ const fn vgpr(n: u8) -> u16 {
 /// 4 dwords of root constants in `s0..s3`, runs `body` (leaving its result in
 /// `v0`), and stores `v0` to dword 0 of the raw UAV at heap index 0.
 fn build_valu_cs(body: &[u32]) -> HostShader {
+    build_cs(body, false, [1, 1, 1], true)
+}
+
+/// `build_valu_cs`'s program shape for `threads`-per-group programs, on a
+/// host with or without 64-lane waves.
+fn build_cs(body: &[u32], wave64: bool, threads: [u32; 3], host_wave64: bool) -> HostShader {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
@@ -85,7 +91,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let native = NativeProgram {
         stage: HwStage::Cs,
-        wave64: false,
+        wave64,
         vgprs: 8,
         layout: vec![
             RootParam {
@@ -117,7 +123,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         }],
         io: StageIo::Cs(ComputeIo {
             rsrc2: 5 << 1, // 5 user SGPRs: s0..s4
-            threads: [1, 1, 1],
+            threads,
         }),
         code,
     };
@@ -136,6 +142,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        host_wave64,
     })
     .expect("lower");
 
@@ -201,6 +208,66 @@ fn run_cases(
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+/// A wave64 program whose group is one console wave (64 threads), lowered
+/// for a host without 64-lane waves: it splits into two 32-lane halves and
+/// must still count, across both halves' ballots, exactly the lanes the
+/// console wave would — 48 of 64 threads have an id below 48. This is the
+/// exchange protocol's end-to-end check; on a 64-lane host the same program
+/// runs unsplit and must give the same answer.
+#[test]
+fn wave64_split_counts_console_lanes_across_halves() {
+    let mut words = Vec::new();
+    words.push(s_mov_b32(5, 0x80)); // descriptor table base s4:s5 = 0
+    words.extend_from_slice(&s_load_dwordx4(12, 4)); // descriptor s[12:15]
+    // v_cmp_gt_u32 vcc, 48, v0: the mask of threads below 48.
+    words.push(0x7D88_00FF);
+    words.push(48);
+    words.push(0xBE8A_106A); // s_bcnt1_i32_b64 s10, vcc
+    words.push(vop1(0x001, 1, sgpr(10))); // v_mov_b32 v1, s10
+    words.extend_from_slice(&buffer_store_dword(1, 12, 0));
+    words.push(S_ENDPGM);
+
+    for (label, host_wave64) in [("split", false), ("native", true)] {
+        let shader = build_cs(&words, true, [64, 1, 1], host_wave64);
+        let mut ran = 0;
+        for (backend, warp) in [("hardware", false), ("warp", true)] {
+            let Ok(host) = Host::new(warp) else {
+                continue;
+            };
+            // The native form needs 64-lane waves; a 32-lane device refuses
+            // it at pipeline creation — exactly what the split fixes. The
+            // split form declares WaveSize(32), which a device under a
+            // 32-lane maximum (some WARP builds) cannot run: skip those,
+            // enforce the split only where it fits.
+            let Ok((root, pso)) = host.compute_pipeline(&shader) else {
+                if label == "split" && backend == "hardware" {
+                    panic!("{label}/{backend}: split form refused");
+                }
+                eprintln!("{label}/{backend}: form refused; skipped");
+                continue;
+            };
+            let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[View::RawUav(1)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}/{backend}: dispatch: {e}"));
+            assert_eq!(out[0][0], 48, "{label}/{backend}");
+            ran += 1;
+        }
+        if label == "split" {
+            assert!(ran > 0, "split: no SM 6.6 device available");
+        }
+    }
 }
 
 fn is_f16_nan(bits: u16) -> bool {

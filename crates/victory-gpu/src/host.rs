@@ -472,6 +472,29 @@ impl Host {
         })
     }
 
+    /// Whether the host runs 64-lane waves; wave64 console programs split
+    /// into two halves when it does not (see `docs/wave64-on-wave32.md`).
+    /// Recorded for the shader translation the first time it is asked.
+    pub(crate) fn wave64(&self) -> bool {
+        static WAVE64: OnceLock<bool> = OnceLock::new();
+        *WAVE64.get_or_init(|| {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+            // SAFETY: the query writes the structure of the given size.
+            let ok = unsafe {
+                self.device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS1,
+                    (&raw mut options).cast(),
+                    size_of_val(&options) as u32,
+                )
+            }
+            .is_ok();
+            let wave64 = ok && options.WaveLaneCountMax >= 64;
+            victory_shader::emit::set_host_wave64(wave64);
+            tracing::info!(wave64, "host 64-lane wave support");
+            wave64
+        })
+    }
+
     /// A new list, open for recording.
     pub(crate) fn new_list(&self) -> windows::core::Result<HostList> {
         // SAFETY: plain object creation.

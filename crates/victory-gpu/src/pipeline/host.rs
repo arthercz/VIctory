@@ -297,6 +297,11 @@ impl HostPipeline {
     /// A host pipeline for vertex and pixel shaders with the graphics
     /// state `g`, or for one compute shader.
     pub(crate) fn new(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {
+        // Before any translation: record the host's wave capability in the
+        // translator (and so in the shader cache's build fingerprint).
+        if let Some(host) = host() {
+            let _ = host.wave64();
+        }
         let find = |stage| shaders.iter().find(|s| s.stage == stage);
         let compute = match shaders {
             [cs] if cs.stage == "compute" => Some(cs),

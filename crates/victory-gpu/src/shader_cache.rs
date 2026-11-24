@@ -50,9 +50,15 @@ fn build() -> &'static [u8; 32] {
                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
         }
+        // The host's wave capability shapes translation (wave64 programs
+        // split on 32-lane hosts); the device records it before the first
+        // pipeline is made. Unset (no device, as in the CLI tools) means
+        // every wave size runs.
+        let wave64 = victory_shader::emit::host_wave64();
         match exe {
             Ok(mut bytes) => {
                 bytes.extend_from_slice(&limit.to_le_bytes());
+                bytes.extend_from_slice(&[wave64 as u8]);
                 *blake3::hash(&bytes).as_bytes()
             }
             Err(e) => {

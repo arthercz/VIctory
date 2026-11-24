@@ -125,11 +125,17 @@ XCL.
    arithmetic (XCL's WaveActiveCountBits form), spin bound size, spin
    polling shape (single-lane spin with verdict broadcast, XCL's exact
    form), all-lane store/bump (current form), fence modes (8 and 9), and
-   full slot zeroing. Every counter, slot index and fence placement
+   full slot zeroing, and plain vs atomic (xchg) exchange stores.
+   Every counter, slot index and fence placement
    checks out statically in the module dump; the asymmetry (one
    direction of the arrival handshake is not observed) violates the
    seq_cst ordering the code establishes. Needs GPU-side tracing
    (PIX/NSight) of the two hardware waves' memory operations.
+   The remaining hypothesis space needs GPU-side memory tracing: the
+   failing half's ballot reads back as 0 through the exchange even
+   though its inputs (thread ids, lane-in-wave values) probe correct,
+   which points at the waveActiveBallot or the TGSM store path of the
+   last-scheduled hardware wave rather than at the protocol.
    The test pins the known values so a fix surfaces here.
    Lane reads (`v_readlane`, `v_readfirstlane`) in multi-wave groups are
    refused for now.

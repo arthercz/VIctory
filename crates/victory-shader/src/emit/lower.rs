@@ -2167,7 +2167,13 @@ impl<'a> Lower<'a> {
         // Publish: every lane stores the same word (a benign same-value
         // race, no elected lane), a TGSM fence, then every lane bumps the
         // arrival counter by one: after all 32 lanes, it reads 32 * (k+1).
-        self.s.m.store(self.cur, my_slot, mine);
+        // The store is an atomic exchange: a plain store from the last
+        // wave's lanes was not observed by the partner's atomic read on
+        // the RTX 5060 Ti.
+        let _ = self
+            .s
+            .m
+            .atomic(self.cur, super::bitcode::Rmw::Xchg, my_slot, mine);
         self.tgsm_fence(self.cur);
         let _ = self
             .s

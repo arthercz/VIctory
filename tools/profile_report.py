@@ -15,6 +15,11 @@ Compare an experiment with a baseline:
   python tools/profile_report.py F:\\VIctory-logs\\default.jsonl \
       --compare F:\\VIctory-logs\\loop-1000.jsonl
 
+Rank shader hashes and print copyable skip/bisection commands:
+
+  python tools/profile_report.py F:\\VIctory-logs\\default.jsonl \
+      --skip-candidates 8
+
 The input is JSONL written by crates/victory-gpu/src/profile.rs. The parser
 ignores incomplete final lines, so captures remain useful after a crash.
 """
@@ -32,10 +37,11 @@ from pathlib import Path
 from typing import Iterable
 
 KNOWN_KINDS = ("sub", "list", "cmd")
-PIPELINE_IN_COMMAND = re.compile(
-    r"\[((?:compute|mesh|vertex|pixel)(?:[^\]\\]|\\.)*)\]",
-    re.IGNORECASE,
-)
+# Host notes are: "<op> <32-digit host pipeline> | <16-digit shader>: ...".
+# VICTORY_SKIP_PIPELINES accepts the 16-digit shader hashes, not the host
+# pipeline-library hash.
+SHADER_IN_COMMAND = re.compile(r"(?:^|\s\|\s)([0-9a-fA-F]{16}):")
+HOST_PIPELINE_IN_COMMAND = re.compile(r"\b([0-9a-fA-F]{32})\b")
 
 
 @dataclass
@@ -152,7 +158,11 @@ def pipeline_exposure(capture: Capture) -> dict[str, tuple[float, float, int]]:
     return {name: (total[name], peak[name], count[name]) for name in total}
 
 
-def command_pipeline_time(capture: Capture) -> dict[str, tuple[float, float, int]]:
+def command_token_time(
+    capture: Capture, pattern: re.Pattern[str]
+) -> dict[str, tuple[float, float, int]]:
+    """Attribute each command's time to every matching token, non-exclusively."""
+
     total: defaultdict[str, float] = defaultdict(float)
     peak: defaultdict[str, float] = defaultdict(float)
     count: defaultdict[str, int] = defaultdict(int)
@@ -161,11 +171,19 @@ def command_pipeline_time(capture: Capture) -> dict[str, tuple[float, float, int
         op = event.get("op", "")
         if not isinstance(op, str):
             continue
-        for pipeline in set(PIPELINE_IN_COMMAND.findall(op)):
-            total[pipeline] += ms
-            peak[pipeline] = max(peak[pipeline], ms)
-            count[pipeline] += 1
+        for token in set(match.lower() for match in pattern.findall(op)):
+            total[token] += ms
+            peak[token] = max(peak[token], ms)
+            count[token] += 1
     return {name: (total[name], peak[name], count[name]) for name in total}
+
+
+def command_shader_time(capture: Capture) -> dict[str, tuple[float, float, int]]:
+    return command_token_time(capture, SHADER_IN_COMMAND)
+
+
+def command_pipeline_time(capture: Capture) -> dict[str, tuple[float, float, int]]:
+    return command_token_time(capture, HOST_PIPELINE_IN_COMMAND)
 
 
 def print_latency_table(capture: Capture) -> None:
@@ -212,14 +230,12 @@ def print_top_events(capture: Capture, kind: str, top: int, title: str) -> None:
         print(f"  {ms:10.2f} ms  t={at:9.3f}  {identity:22}  {detail}")
 
 
-def print_pipelines(capture: Capture, top: int) -> None:
-    direct = command_pipeline_time(capture)
-    exposure = pipeline_exposure(capture)
-    values = direct if direct else exposure
+def print_ranked_times(
+    values: dict[str, tuple[float, float, int]], top: int, title: str
+) -> None:
     if not values:
         return
-    meaning = "timed-command GPU time" if direct else "slow-list exposure (non-exclusive)"
-    print(f"\n== top {top} pipelines by {meaning} ==")
+    print(f"\n== top {top} {title} ==")
     for name, (total, peak, count) in sorted(
         values.items(), key=lambda item: item[1][0], reverse=True
     )[:top]:
@@ -227,6 +243,53 @@ def print_pipelines(capture: Capture, top: int) -> None:
             f"  {total:10.1f} ms total  {peak:9.2f} ms peak"
             f"  {count:7d} samples  {name}"
         )
+
+
+def print_pipelines(capture: Capture, top: int) -> None:
+    print_ranked_times(
+        command_shader_time(capture),
+        top,
+        "shader hashes by timed-command exposure (non-exclusive, skip-able)",
+    )
+    direct = command_pipeline_time(capture)
+    exposure = pipeline_exposure(capture)
+    print_ranked_times(
+        direct if direct else exposure,
+        top,
+        "host pipelines by timed-command exposure"
+        if direct
+        else "host pipelines by command-list exposure (non-exclusive)",
+    )
+
+
+def print_skip_candidates(capture: Capture, limit: int) -> None:
+    ranked = sorted(
+        command_shader_time(capture).items(),
+        key=lambda item: item[1][0],
+        reverse=True,
+    )[:limit]
+    if not ranked:
+        print(
+            "\nno skip candidates: the capture has no timed commands with"
+            " 16-digit shader hashes"
+        )
+        return
+    print(f"\n== top {len(ranked)} VICTORY_SKIP_PIPELINES candidates ==")
+    print("Command time is credited to every shader stage, so attribution is non-exclusive.")
+    for index, (shader, (total, peak, count)) in enumerate(ranked, 1):
+        print(
+            f"  {index:2d}. {shader}  {total:10.1f} ms total"
+            f"  {peak:9.2f} ms peak  {count:7d} commands"
+        )
+    hashes = [shader for shader, _ in ranked]
+    print("\nPowerShell: skip all candidates first:")
+    print(f'$env:VICTORY_SKIP_PIPELINES = "{",".join(hashes)}"')
+    if len(hashes) > 1:
+        middle = (len(hashes) + 1) // 2
+        print("\nThen bisect if the symptom changes:")
+        print(f'$env:VICTORY_SKIP_PIPELINES = "{",".join(hashes[:middle])}"  # first half')
+        print(f'$env:VICTORY_SKIP_PIPELINES = "{",".join(hashes[middle:])}"  # second half')
+    print("Remove-Item Env:VICTORY_SKIP_PIPELINES -ErrorAction SilentlyContinue  # restore")
 
 
 def print_timeline(capture: Capture, bucket_seconds: int) -> None:
@@ -335,6 +398,13 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--top", type=int, default=20, help="number of hotspots to show")
     result.add_argument("--timeline", action="store_true", help="show list time over the run")
     result.add_argument(
+        "--skip-candidates",
+        type=int,
+        default=0,
+        metavar="N",
+        help="rank N shader hashes and print VICTORY_SKIP_PIPELINES bisection commands",
+    )
+    result.add_argument(
         "--bucket",
         type=int,
         default=10,
@@ -349,6 +419,8 @@ def main(argv: list[str] | None = None) -> int:
         parser().error("--top must be at least 1")
     if args.bucket < 1:
         parser().error("--bucket must be at least 1")
+    if args.skip_candidates < 0:
+        parser().error("--skip-candidates cannot be negative")
     try:
         baseline = load_capture(args.capture)
         candidate = load_capture(args.compare) if args.compare else None
@@ -364,6 +436,8 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     print_report(baseline, args.top, args.timeline, args.bucket)
+    if args.skip_candidates:
+        print_skip_candidates(baseline, args.skip_candidates)
     if candidate is not None:
         print_report(candidate, args.top, args.timeline, args.bucket)
         print_comparison(baseline, candidate)
